@@ -23,7 +23,7 @@ CHUNK_FRAMES = 1024   # captura loopback (~21 ms)
 MIC_FRAMES = 480      # salida a VB-Cable (~10 ms)
 HEARTBEAT_SEC = 8     # ping al celular; si no responde, se cierra la sesión zombi
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-HTTP_PORT = 8080      # puerto sin TLS para la app Android (los WebSockets del WebView no aceptan certificados autofirmados)
+HTTP_PORT = 8080      # puerto sin TLS para la app Android (HTTP + WebSocket + UDP Discovery)
 FROZEN = getattr(sys, "frozen", False)
 APP_DIR = os.path.dirname(sys.executable) if FROZEN else BASE_DIR   # junto al .exe: cert.pem y key.pem persisten
 RES_DIR = getattr(sys, "_MEIPASS", BASE_DIR)                        # recursos empaquetados (index.html)
@@ -34,16 +34,46 @@ active_ws = None   # única sesión activa
 pc_queue = None    # cola de audio PC -> celular de la sesión activa
 
 
-def get_local_ip():
-    """Obtiene la IP local real de la tarjeta Wi-Fi/Ethernet activa."""
+def get_all_local_ips():
+    """Devuelve todas las direcciones IPv4 privadas activas de la PC (Wi-Fi, Ethernet, Zona portátil)."""
+    ips = []
+    for target in (("8.8.8.8", 80), ("192.168.137.1", 80), ("192.168.43.1", 80), ("192.168.1.1", 80)):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(target)
+            ip = s.getsockname()[0]
+            s.close()
+            if ip and not ip.startswith("127.") and not ip.startswith("169.254.") and ip not in ips:
+                ips.append(ip)
+        except Exception:
+            pass
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
+        _, _, host_ips = socket.gethostbyname_ex(socket.gethostname())
+        for ip in host_ips:
+            if ip and not ip.startswith("127.") and not ip.startswith("169.254.") and ip not in ips:
+                ips.append(ip)
     except Exception:
-        return socket.gethostbyname(socket.gethostname())
+        pass
+    return ips or ["127.0.0.1"]
+
+
+def get_local_ip():
+    """Obtiene la IP local principal de la tarjeta Wi-Fi/Ethernet/Hotspot activa."""
+    return get_all_local_ips()[0]
+
+
+class UdpDiscoveryProtocol(asyncio.DatagramProtocol):
+    """Responde a paquetes UDP Broadcast de autodescubrimiento enviados por la app Android."""
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        if data and b"NEXOAUDIO_DISCOVER" in data and self.transport:
+            reply = json.dumps({"app": "nexoaudio", "port": HTTP_PORT}).encode("utf-8")
+            try:
+                self.transport.sendto(reply, addr)
+            except Exception:
+                pass
 
 
 def _cert_matches_ip(cert_path: str, local_ip: str) -> bool:
@@ -76,12 +106,15 @@ def ensure_ssl_certs(local_ip, cert_path=os.path.join(APP_DIR, "cert.pem"), key_
         x509.DNSName("localhost"),
         x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
     ]
-    try:
-        ip_obj = ipaddress.ip_address(local_ip)
-        if ip_obj != ipaddress.ip_address("127.0.0.1"):
-            san_list.append(x509.IPAddress(ip_obj))
-    except ValueError:
-        pass
+    seen_ips = {ipaddress.ip_address("127.0.0.1")}
+    for ip_str in [local_ip] + get_all_local_ips():
+        try:
+            ip_obj = ipaddress.ip_address(ip_str)
+            if ip_obj not in seen_ips:
+                seen_ips.add(ip_obj)
+                san_list.append(x509.IPAddress(ip_obj))
+        except ValueError:
+            pass
 
     cert = (
         x509.CertificateBuilder()
@@ -326,11 +359,24 @@ async def index_handler(request):
     return web.FileResponse(os.path.join(RES_DIR, "index.html"))
 
 
+PING_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+    "Access-Control-Allow-Headers": "*",
+    "Access-Control-Allow-Private-Network": "true",
+    "Cache-Control": "no-store",
+}
+
+
 async def ping_handler(request):
-    """Endpoint ligero con CORS para autodescubrimiento desde la app Android."""
+    """Endpoint ligero con CORS y soporte de red privada para autodescubrimiento desde la app Android."""
+    if request.method == "OPTIONS":
+        return web.Response(status=204, headers=PING_HEADERS)
+    sockname = request.transport.get_extra_info("sockname") if request.transport else None
+    actual_ip = sockname[0] if sockname and isinstance(sockname, tuple) and sockname[0] != "0.0.0.0" else get_local_ip()
     return web.json_response(
-        {"app": "nexoaudio", "ip": get_local_ip()},
-        headers={"Access-Control-Allow-Origin": "*"},
+        {"app": "nexoaudio", "ip": actual_ip},
+        headers=PING_HEADERS,
     )
 
 
@@ -428,6 +474,7 @@ async def main():
         pass
 
     local_ip = get_local_ip()
+    all_ips = get_all_local_ips()
     cert_file, key_file = ensure_ssl_certs(local_ip)
 
     ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -437,12 +484,23 @@ async def main():
     app.router.add_get("/", index_handler)
     app.router.add_get("/ws", websocket_handler)
     app.router.add_get("/ping", ping_handler)
+    app.router.add_route("OPTIONS", "/ping", ping_handler)
 
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=PORT, ssl_context=ssl_ctx)
     await site.start()
     await web.TCPSite(runner, host="0.0.0.0", port=HTTP_PORT).start()  # sin TLS, para la app Android
+
+    # Servidor UDP en puerto 8080 para autodescubrimiento instantáneo por Broadcast desde Android
+    udp_transport = None
+    try:
+        udp_transport, _ = await main_loop.create_datagram_endpoint(
+            lambda: UdpDiscoveryProtocol(),
+            local_addr=("0.0.0.0", HTTP_PORT),
+        )
+    except Exception:
+        pass
 
     audio_engine.start()
 
@@ -451,7 +509,7 @@ async def main():
     print("\n" + "=" * 62)
     print(" [OK] SERVIDOR NEXOAUDIO ACTIVO Y ESCUCHANDO")
     print(f" >> URL directa: {url}")
-    print(f" >> App Android -> IP autodetectable o manual: {local_ip}")
+    print(f" >> App Android -> IP autodetectable o manual: {', '.join(all_ips)}")
     print(" >> Escanea este código QR con la cámara de tu celular:")
     print("=" * 62 + "\n")
 
@@ -474,6 +532,11 @@ async def main():
     except asyncio.CancelledError:
         pass
     finally:
+        if udp_transport:
+            try:
+                udp_transport.close()
+            except Exception:
+                pass
         audio_engine.stop()
         await runner.cleanup()
 

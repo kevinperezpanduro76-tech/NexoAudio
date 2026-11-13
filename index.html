@@ -243,10 +243,17 @@
   <script>
     const TARGET_MS = 50;           // colchón de jitter: más alto = más estable, más bajo = menos retraso
     const CONNECT_TIMEOUT_MS = 8000;
+    const AUTO_RETRY_MS = 3500;     // reintento automático en segundo plano mientras esté en espera
     const KOFI_URL = "";            // <- si agregas un enlace de Ko-fi, aparecerá junto a Patreon
     const PATREON_URL = "https://patreon.com/Kaell456?utm_medium=unknown&utm_source=join_link&utm_campaign=creatorshare_creator&utm_content=copyLink";
     const APP_PORT = 8080;          // puerto sin TLS del servidor (lo usa la app Android)
-    const IN_APP = !!window.Capacitor;  // en la APK la página es local: hay que indicar la IP
+    const IN_APP = Boolean(
+      window.Capacitor ||
+      window.NexoNative ||
+      location.protocol === "file:" ||
+      location.hostname === "localhost" ||
+      location.hostname === "127.0.0.1"
+    );
 
     let ws = null, audioCtx = null, micStream = null, micSource = null, node = null, wakeLock = null;
     let state = "idle";             // idle | connecting | connected
@@ -255,6 +262,7 @@
     let echoCancel = false;         // anti-eco del navegador: apagado por defecto (audio crudo)
     let switchingMic = false;
     let scanning = false;
+    let manualDisconnect = false;   // evita reconectar a la fuerza si el usuario desconectó manualmente
 
     const connectBtn = document.getElementById("connectBtn");
     const btnLabel = document.getElementById("btnLabel");
@@ -287,6 +295,18 @@
       links.hidden = !links.hidden;
     });
 
+    // Desbloquea el AudioContext al primer toque en pantalla si el sistema lo mantuvo suspendido
+    const unlockAudioOnTouch = () => {
+      if (audioCtx && audioCtx.state === "suspended") {
+        audioCtx.resume().catch(() => {});
+      }
+      if (state === "connected" && micEnabled && !micStream) {
+        attachMicrophone();
+      }
+    };
+    window.addEventListener("pointerdown", unlockAudioOnTouch, { passive: true });
+    window.addEventListener("touchstart", unlockAudioOnTouch, { passive: true });
+
     const LABELS = {
       idle: ["CONECTAR", "Toca para iniciar"],
       connecting: ["CONECTANDO…", "Espera un momento"],
@@ -304,70 +324,172 @@
       if (text) statusText.textContent = text;
     }
 
-    async function checkServerIp(ip, timeoutMs = 550) {
+    async function checkServerIp(ip, timeoutMs = 750) {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), timeoutMs);
       try {
-        const r = await fetch(`http://${ip}:${APP_PORT}/ping`, { signal: ctrl.signal });
+        const r = await fetch(`http://${ip}:${APP_PORT}/ping`, {
+          signal: ctrl.signal,
+          cache: "no-store",
+          mode: "cors"
+        });
         const data = await r.json();
-        if (data && data.app === "nexoaudio") return data.ip || ip;
+        if (data && data.app === "nexoaudio") return ip;
       } catch (e) {} finally {
         clearTimeout(t);
       }
       throw new Error("no_match");
     }
 
-    async function autoDiscoverServer() {
+    // Obtiene los prefijos de subred reales del teléfono desde el puente nativo Android y/o WebRTC
+    async function getPhoneSubnetPrefixes() {
+      const prefixes = new Set();
+      if (window.NexoNative && typeof window.NexoNative.getLocalSubnets === "function") {
+        try {
+          const arr = JSON.parse(window.NexoNative.getLocalSubnets() || "[]");
+          if (Array.isArray(arr)) arr.forEach((p) => { if (p) prefixes.add(p); });
+        } catch (e) {}
+      }
+      if (window.RTCPeerConnection) {
+        await new Promise((resolve) => {
+          let done = false;
+          const finish = () => { if (!done) { done = true; resolve(); } };
+          setTimeout(finish, 500);
+          try {
+            const pc = new RTCPeerConnection({ iceServers: [] });
+            pc.createDataChannel("");
+            pc.onicecandidate = (e) => {
+              if (!e || !e.candidate || !e.candidate.candidate) return;
+              const m = e.candidate.candidate.match(/\b((?:192\.168|10\.\d+|172\.(?:1[6-9]|2\d|3[01]))\.\d+)\.\d+\b/);
+              if (m) {
+                prefixes.add(m[1]);
+                try { pc.close(); } catch (err) {}
+                finish();
+              }
+            };
+            pc.createOffer().then((o) => pc.setLocalDescription(o)).catch(finish);
+          } catch (e) {
+            finish();
+          }
+        });
+      }
+      return [...prefixes];
+    }
+
+    // Escanea una lista de IPs con concurrencia controlada para no saturar sockets del WebView
+    async function scanIpList(ips, concurrency = 16, timeoutMs = 700) {
+      if (!ips.length) return null;
+      return new Promise((resolve) => {
+        let idx = 0, active = 0, found = null;
+        function next() {
+          if (found || state !== "idle") {
+            if (active === 0) resolve(found);
+            return;
+          }
+          while (active < concurrency && idx < ips.length && !found && state === "idle") {
+            const ip = ips[idx++];
+            active++;
+            checkServerIp(ip, timeoutMs)
+              .then((res) => {
+                if (!found) {
+                  found = res;
+                  resolve(res);
+                }
+              })
+              .catch(() => {})
+              .finally(() => {
+                active--;
+                if (!found && idx >= ips.length && active === 0) resolve(null);
+                else if (!found) next();
+              });
+          }
+        }
+        next();
+      });
+    }
+
+    async function autoDiscoverServer(autoConnect = true) {
       if (!IN_APP || scanning || state !== "idle") return;
       scanning = true;
       scanBtn.disabled = true;
+      let discoveredIp = null;
 
       try {
         const saved = ipInput.value.trim().replace(/^[a-z]+:\/\//i, "").replace(/[:/].*$/, "");
-        // 1. Verifica primero si la IP guardada sigue activa
-        if (/^\d+\.\d+\.\d+\.\d+$/.test(saved)) {
+
+        // 1. Descubrimiento instantáneo por Broadcast UDP nativo (encuentra la PC en ~10 ms en cualquier subred)
+        if (window.NexoNative && typeof window.NexoNative.discoverServer === "function") {
           try {
-            const verified = await checkServerIp(saved, 500);
-            ipInput.value = verified;
-            try { localStorage.setItem("serverIp", verified); } catch (e) {}
-            statusText.textContent = `Laptop lista en ${verified}`;
-            return;
+            const udpIp = (window.NexoNative.discoverServer(APP_PORT, 420) || "").trim();
+            if (/^\d+\.\d+\.\d+\.\d+$/.test(udpIp)) {
+              discoveredIp = udpIp;
+            }
           } catch (e) {}
         }
 
-        // 2. Escanea subredes locales comunes (empezando por la de la última IP guardada)
-        const savedPrefix = saved.match(/^(\d+\.\d+\.\d+)\./)?.[1];
-        const prefixes = [...new Set([savedPrefix, "192.168.1", "192.168.0", "192.168.18", "192.168.100"].filter(Boolean))];
+        // 2. Verificación rápida de IP guardada y puertas de enlace de Hotspot (Windows y Android)
+        if (!discoveredIp && state === "idle") {
+          const quickCandidates = [...new Set([
+            /^\d+\.\d+\.\d+\.\d+$/.test(saved) ? saved : null,
+            "192.168.137.1", // Zona con cobertura inalámbrica de Windows
+            "192.168.43.1"   // Hotspot de Android
+          ].filter(Boolean))];
+          const quickHit = await scanIpList(quickCandidates, 4, 650);
+          if (quickHit) discoveredIp = quickHit;
+        }
 
-        for (const prefix of prefixes) {
-          if (state !== "idle") return;
-          statusText.textContent = `Buscando laptop en ${prefix}.x...`;
-          for (let base = 1; base < 255; base += 50) {
-            if (state !== "idle") return;
-            const batch = [];
-            for (let i = base; i < Math.min(255, base + 50); i++) {
-              batch.push(checkServerIp(`${prefix}.${i}`));
+        // 3. Escaneo por subredes priorizando las interfaces reales detectadas en el celular
+        if (!discoveredIp && state === "idle") {
+          const phonePrefixes = await getPhoneSubnetPrefixes();
+          const savedPrefix = saved.match(/^(\d+\.\d+\.\d+)\./)?.[1];
+          const prefixes = [...new Set([
+            ...phonePrefixes,
+            savedPrefix,
+            "192.168.1",
+            "192.168.0",
+            "192.168.18",
+            "192.168.100",
+            "192.168.137",
+            "192.168.43",
+            "192.168.31",
+            "192.168.68",
+            "10.0.0"
+          ].filter(Boolean))];
+
+          for (const prefix of prefixes) {
+            if (state !== "idle" || discoveredIp) break;
+            statusText.textContent = `Buscando laptop en ${prefix}.x...`;
+            const ips = [];
+            for (let i = 1; i < 255; i++) ips.push(`${prefix}.${i}`);
+            const found = await scanIpList(ips, 16, 650);
+            if (found) {
+              discoveredIp = found;
+              break;
             }
-            try {
-              const foundIp = await Promise.any(batch);
-              ipInput.value = foundIp;
-              try { localStorage.setItem("serverIp", foundIp); } catch (e) {}
-              statusText.textContent = `Laptop encontrada en ${foundIp}`;
-              return;
-            } catch (e) {}
           }
         }
-        if (state === "idle") {
-          statusText.textContent = "Escribe la IP de tu laptop o toca 🔍 para reintentar";
+
+        if (discoveredIp) {
+          ipInput.value = discoveredIp;
+          try { localStorage.setItem("serverIp", discoveredIp); } catch (e) {}
+          statusText.textContent = `Laptop detectada en ${discoveredIp}. Conectando...`;
+        } else if (state === "idle") {
+          statusText.textContent = "Esperando a tu laptop en la red (o escribe la IP)...";
         }
       } finally {
         scanning = false;
         scanBtn.disabled = state !== "idle";
       }
+
+      if (discoveredIp && autoConnect && state === "idle") {
+        startConnection();
+      }
     }
 
-    scanBtn.addEventListener("click", autoDiscoverServer);
-    if (IN_APP) autoDiscoverServer();
+    scanBtn.addEventListener("click", () => {
+      manualDisconnect = false;
+      autoDiscoverServer(true);
+    });
 
     toggleSpeakerBtn.addEventListener("click", () => {
       speakerEnabled = !speakerEnabled;
@@ -380,28 +502,47 @@
       micEnabled = !micEnabled;
       toggleMicBtn.textContent = micEnabled ? "🎙️ Micrófono: ON" : "🚫 Micrófono: OFF";
       toggleMicBtn.classList.toggle("off", !micEnabled);
+      if (micEnabled && state === "connected" && !micStream) {
+        attachMicrophone();
+      }
     });
 
     const micConstraints = () => ({ echoCancellation: echoCancel, noiseSuppression: false, autoGainControl: false, channelCount: 1 });
-    const connectedText = () => `Audio ${echoCancel ? "con anti-eco" : "en crudo"} activo (${audioCtx.sampleRate} Hz)`;
+    const connectedText = () => `Audio ${echoCancel ? "con anti-eco" : "en crudo"} activo (${audioCtx ? audioCtx.sampleRate : 48000} Hz)`;
 
     function renderEcho() {
       toggleEchoBtn.textContent = echoCancel ? "🎧 Anti-eco: ON" : "🎧 Anti-eco: OFF";
       toggleEchoBtn.classList.toggle("on", echoCancel);
     }
 
+    async function attachMicrophone() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !audioCtx || !node || micStream) return;
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints() });
+        if (state === "idle" || !audioCtx || !node) {
+          stream.getTracks().forEach((t) => t.stop());
+          return;
+        }
+        micStream = stream;
+        micSource = audioCtx.createMediaStreamSource(micStream);
+        micSource.connect(node);
+        if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
+      } catch (err) {
+        console.warn("Permiso o acceso al micrófono pendiente:", err);
+      }
+    }
+
     toggleEchoBtn.addEventListener("click", async () => {
       if (switchingMic) return;
       echoCancel = !echoCancel;
       renderEcho();
-      if (state !== "connected" || !micStream) return;   // desconectado: se aplicará al conectar
+      if (state !== "connected" || !micStream) return;
 
-      // El navegador fija el anti-eco al abrir el micrófono: se reabre y se cambia la fuente sin cortar la sesión
       switchingMic = true;
       try {
         const next = await navigator.mediaDevices.getUserMedia({ audio: micConstraints() });
         if (state !== "connected") { next.getTracks().forEach((t) => t.stop()); return; }
-        micSource.disconnect();
+        if (micSource) micSource.disconnect();
         micStream.getTracks().forEach((t) => t.stop());
         micStream = next;
         micSource = audioCtx.createMediaStreamSource(micStream);
@@ -417,8 +558,13 @@
     });
 
     connectBtn.addEventListener("click", () => {
-      if (state === "idle") startConnection();
-      else if (state === "connected") stopConnection();
+      if (state === "idle") {
+        manualDisconnect = false;
+        startConnection();
+      } else if (state === "connected") {
+        manualDisconnect = true;
+        stopConnection("Desconectado. Toca CONECTAR para volver a iniciar");
+      }
     });
 
     async function acquireWakeLock() {
@@ -430,14 +576,16 @@
       } catch (e) {}
     }
 
-    // El navegador libera el Wake Lock y puede suspender el audio al ocultar la pestaña: se recupera al volver
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState !== "visible" || state !== "connected") return;
-      acquireWakeLock();
-      if (audioCtx && audioCtx.state !== "running") audioCtx.resume().catch(() => {});
+      if (document.visibilityState !== "visible") return;
+      if (state === "connected") {
+        acquireWakeLock();
+        if (audioCtx && audioCtx.state !== "running") audioCtx.resume().catch(() => {});
+      } else if (IN_APP && state === "idle" && !manualDisconnect) {
+        autoDiscoverServer(true);
+      }
     });
 
-    // Libera TODO y deja la UI lista para reconectar. Es seguro llamarla en cualquier estado y varias veces.
     function stopConnection(msg) {
       state = "idle";
       if (ws) {
@@ -470,7 +618,6 @@
       setUI("idle", msg || "Listo para conectar a tu Laptop");
     }
 
-    // Devuelve "IP:puerto" a partir de lo escrito (acepta que peguen la URL completa) y la recuerda
     function serverHost() {
       const v = ipInput.value.trim().replace(/^[a-z]+:\/\//i, "").replace(/[:/].*$/, "");
       if (!/^[\w.-]+$/.test(v)) return "";
@@ -479,28 +626,22 @@
     }
 
     async function startConnection() {
-      if (state !== "idle") return;   // evita doble clic / sesiones duplicadas
+      if (state !== "idle") return;
       if (IN_APP && !serverHost()) {
-        statusText.textContent = "Escribe la IP de tu laptop (ej. 192.168.1.20)";
-        ipInput.focus();
+        statusText.textContent = "Buscando IP de tu laptop automáticamente...";
+        await autoDiscoverServer(true);
         return;
       }
       state = "connecting";
-      setUI("connecting", "Solicitando acceso al micrófono...");
+      setUI("connecting", "Conectando con la laptop...");
 
       try {
-        // 1. AudioContext dentro del gesto del usuario
+        // 1. AudioContext sin bloquear la autoconexión
         const Ctx = window.AudioContext || window.webkitAudioContext;
         audioCtx = new Ctx({ latencyHint: "interactive" });
-        await audioCtx.resume();
+        audioCtx.resume().catch(() => {});
 
-        // 2. Micrófono en crudo (sin filtros que vuelvan la voz metálica)
-        micStream = await navigator.mediaDevices.getUserMedia({
-          audio: micConstraints()
-        });
-        acquireWakeLock();
-
-        // 3. AudioWorklet cargado desde un Blob (no requiere una segunda petición al servidor)
+        // 2. AudioWorklet cargado desde un Blob
         const blobUrl = URL.createObjectURL(
           new Blob([document.getElementById("relay-worklet").textContent], { type: "application/javascript" })
         );
@@ -514,15 +655,14 @@
           channelCountMode: "explicit"
         });
         node.port.onmessage = onMicChunk;
-        micSource = audioCtx.createMediaStreamSource(micStream);
-        micSource.connect(node);
         node.connect(audioCtx.destination);
 
-        // 4. WebSocket
-        setUI("connecting", "Conectando con la laptop...");
+        // 3. Abre el WebSocket de inmediato y solicita el micrófono en paralelo (evita bloqueos por diálogos de permiso)
+        acquireWakeLock();
         openSocket();
+        attachMicrophone();
       } catch (err) {
-        stopConnection("Error: " + (err.message || "Permiso de micrófono denegado"));
+        stopConnection("Error: " + (err.message || "No se pudo iniciar el motor de audio"));
       }
     }
 
@@ -535,22 +675,26 @@
 
       sock.onopen = () => {
         state = "connected";
+        if (audioCtx && audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
         setUI("connected", connectedText());
-        // Debe ir antes del primer paquete de micrófono: el servidor remuestrea según esta frecuencia
-        sock.send(JSON.stringify({ type: "client_config", mic_rate: audioCtx.sampleRate }));
+        sock.send(JSON.stringify({ type: "client_config", mic_rate: audioCtx ? audioCtx.sampleRate : 48000 }));
       };
       sock.onmessage = onSocketMessage;
 
-      const dropped = (e) => stopConnection(
-        e && e.reason === "replaced" ? "Otro dispositivo tomó la sesión"
-          : state === "connected" ? "Conexión perdida con la laptop"
-          : "No se pudo conectar: revisa la IP y que ambos estén en la misma red"
-      );
+      const dropped = (e) => {
+        const wasConnected = state === "connected";
+        if (e && e.reason === "replaced") manualDisconnect = true;
+        stopConnection(
+          e && e.reason === "replaced" ? "Otro dispositivo tomó la sesión"
+            : wasConnected ? "Conexión perdida. Reintentando..."
+            : "No se pudo conectar: buscando laptop en la red..."
+        );
+      };
       sock.onclose = dropped;
       sock.onerror = dropped;
 
       setTimeout(() => {
-        if (ws === sock && state === "connecting") stopConnection("Tiempo de espera agotado");
+        if (ws === sock && state === "connecting") stopConnection("Tiempo de espera agotado. Reintentando...");
       }, CONNECT_TIMEOUT_MS);
     }
 
@@ -572,8 +716,23 @@
 
     function onMicChunk(e) {
       if (!micEnabled || !ws || ws.readyState !== WebSocket.OPEN) return;
-      if (ws.bufferedAmount > 16384) return;   // red atascada: descarta en vez de acumular retraso
+      if (ws.bufferedAmount > 16384) return;
       ws.send(e.data);
+    }
+
+    // Autodescubrimiento y autoconexión al iniciar y en segundo plano mientras esté en espera
+    if (IN_APP) {
+      const triggerAuto = () => {
+        if (state === "idle" && !scanning && !manualDisconnect && document.activeElement !== ipInput) {
+          autoDiscoverServer(true);
+        }
+      };
+      if (document.readyState === "loading") {
+        window.addEventListener("DOMContentLoaded", triggerAuto);
+      } else {
+        triggerAuto();
+      }
+      setInterval(triggerAuto, AUTO_RETRY_MS);
     }
   </script>
 </body>
