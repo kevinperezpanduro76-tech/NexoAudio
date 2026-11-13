@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>NexoAudio</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --card: #1e293b;
+      --primary: #3b82f6;
+      --active: #10b981;
+      --danger: #ef4444;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+    }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: space-between;
+      padding: 28px 20px;
+    }
+    header { text-align: center; width: 100%; }
+    header h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.02em; }
+    #statusText { margin-top: 6px; font-size: 0.92rem; color: var(--muted); }
+    .main-btn-wrapper { display: flex; align-items: center; justify-content: center; flex: 1; width: 100%; }
+    #connectBtn {
+      width: 240px;
+      height: 240px;
+      border-radius: 50%;
+      border: none;
+      background: radial-gradient(circle at 30% 30%, #60a5fa, var(--primary));
+      color: white;
+      font-size: 1.5rem;
+      font-weight: 800;
+      letter-spacing: 0.05em;
+      cursor: pointer;
+      box-shadow: 0 0 50px rgba(59, 130, 246, 0.45);
+      transition: transform 0.15s ease, background 0.25s ease, box-shadow 0.25s ease, opacity 0.25s ease;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+    }
+    #connectBtn:active { transform: scale(0.95); }
+    #connectBtn:disabled { opacity: 0.6; cursor: default; transform: none; }
+    #connectBtn.connected {
+      background: radial-gradient(circle at 30% 30%, #34d399, var(--active));
+      box-shadow: 0 0 60px rgba(16, 185, 129, 0.5);
+    }
+    #connectBtn span.sub { font-size: 0.8rem; font-weight: 500; opacity: 0.9; letter-spacing: 0; }
+    .controls { width: 100%; max-width: 380px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .toggle-btn {
+      background: var(--card);
+      border: 1px solid #334155;
+      color: var(--text);
+      padding: 14px 12px;
+      border-radius: 14px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .toggle-btn.off { opacity: 0.5; border-color: var(--danger); color: #fca5a5; }
+    .toggle-btn.on { border-color: var(--active); color: #6ee7b7; }
+    .toggle-btn:disabled { opacity: 0.5; cursor: default; }
+    #toggleEcho { grid-column: 1 / -1; }
+    [hidden] { display: none !important; }
+    input { user-select: text; -webkit-user-select: text; }
+    .ip-field { width: 100%; max-width: 380px; margin: 14px auto 0; }
+    .ip-row { display: flex; gap: 8px; }
+    .ip-field input {
+      flex: 1; padding: 14px 16px; border-radius: 14px; border: 1px solid #334155;
+      background: var(--card); color: var(--text); font-size: 1rem; text-align: center; outline: none;
+    }
+    .ip-field input:focus { border-color: var(--primary); }
+    .ip-field input:disabled { opacity: 0.5; }
+    #scanBtn {
+      padding: 0 16px; border-radius: 14px; border: 1px solid #334155;
+      background: var(--card); color: var(--text); font-size: 1.1rem; cursor: pointer;
+    }
+    #scanBtn:disabled { opacity: 0.5; cursor: default; }
+    .ip-field small { display: block; margin-top: 6px; font-size: 0.78rem; color: var(--muted); }
+    .support { width: 100%; max-width: 380px; margin-top: 16px; text-align: center; }
+    #supportBtn {
+      width: 100%; padding: 13px 12px; border-radius: 14px; border: 1px solid rgba(244, 114, 182, 0.45);
+      background: linear-gradient(135deg, rgba(236, 72, 153, 0.16), rgba(139, 92, 246, 0.16));
+      color: #fbcfe8; font-size: 0.9rem; font-weight: 600; cursor: pointer;
+    }
+    .support-links { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+    .support-links a { padding: 12px; border-radius: 12px; text-decoration: none; color: #fff; font-weight: 700; font-size: 0.9rem; }
+    #kofiLink { background: #29abe0; }
+    #patreonLink { background: #f96854; }
+    #patreonLink.full { grid-column: 1 / -1; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>NexoAudio Local</h1>
+    <p id="statusText">Listo para conectar a tu Laptop</p>
+    <div class="ip-field" id="ipField" hidden>
+      <div class="ip-row">
+        <input id="serverIp" type="text" inputmode="decimal" placeholder="IP de tu laptop (ej. 192.168.1.20)" autocomplete="off" autocapitalize="off" spellcheck="false" />
+        <button id="scanBtn" type="button" title="Buscar laptop en la red">🔍</button>
+      </div>
+      <small>Se busca automáticamente o escríbela según la consola de tu PC</small>
+    </div>
+  </header>
+
+  <div class="main-btn-wrapper">
+    <button id="connectBtn">
+      <span id="btnLabel">CONECTAR</span>
+      <span class="sub" id="btnSub">Toca para iniciar</span>
+    </button>
+  </div>
+
+  <div class="controls">
+    <button id="toggleSpeaker" class="toggle-btn">🔊 Altavoz: ON</button>
+    <button id="toggleMic" class="toggle-btn">🎙️ Micrófono: ON</button>
+    <button id="toggleEcho" class="toggle-btn">🎧 Anti-eco: OFF</button>
+  </div>
+
+  <div class="support">
+    <button id="supportBtn">💜 Apoyar proyecto (Patreon)</button>
+    <div class="support-links" id="supportLinks" hidden>
+      <a id="kofiLink" target="_blank" rel="noopener">Ko-fi</a>
+      <a id="patreonLink" target="_blank" rel="noopener">Patreon</a>
+    </div>
+  </div>
+
+  <!-- AudioWorklet (se carga vía Blob URL): captura del micro + reproducción con ring buffer -->
+  <script type="text/js-worklet" id="relay-worklet">
+    const CAP = 1 << 17, MASK = CAP - 1;   // ring buffer: 131072 frames por canal
+    const MIC_CHUNK = 512;                 // ~10 ms por paquete de micrófono
+
+    class RelayProcessor extends AudioWorkletProcessor {
+      constructor() {
+        super();
+        this.L = new Float32Array(CAP);
+        this.R = new Float32Array(CAP);
+        this.ch = 2; this.ratio = 1; this.target = 2400;
+        this.pcm = new Int16Array(MIC_CHUNK); this.ci = 0;
+        this.reset();
+        this.port.onmessage = (e) => {
+          const m = e.data;
+          if (m.type === "cfg") {
+            this.ch = Math.max(1, m.channels | 0);
+            this.ratio = m.rate / sampleRate;                  // frames de origen por frame de salida
+            this.target = Math.round(m.rate * m.targetMs / 1000);
+            this.reset();
+          } else if (m.type === "flush") this.reset();
+          else if (m.type === "pcm") this.write(new Int16Array(m.buf));
+        };
+      }
+
+      reset() {
+        this.w = 0; this.rp = 0; this.fs = 0; this.g = 0; this.dk = 0;
+        this.lastL = 0; this.lastR = 0; this.playing = false;
+      }
+
+      write(s) {
+        const ch = this.ch, n = (s.length / ch) | 0;
+        for (let i = 0; i < n; i++) {
+          const o = i * ch, j = (this.w + i) & MASK;
+          let l = s[o], r = ch > 1 ? s[o + 1] : l;
+          if (ch >= 6) {   // 5.1 -> estéreo (suma centro y traseros)
+            const c = s[o + 2] * 0.7071;
+            l = (l + c + s[o + 4] * 0.7071) * 0.6;
+            r = (r + c + s[o + 5] * 0.7071) * 0.6;
+          }
+          this.L[j] = l / 32768; this.R[j] = r / 32768;
+        }
+        this.w += n;
+        // Si el retraso acumulado supera 6x el colchón, salta al colchón objetivo (caso raro)
+        if (this.w - this.rp > this.target * 6) { this.rp = this.w - this.target; this.g = 0; }
+      }
+
+      process(inputs, outputs) {
+        // --- Captura: mono -> Int16 en bloques de 512, transferidos sin copia ---
+        const inp = inputs[0] && inputs[0][0];
+        if (inp) {
+          for (let i = 0; i < inp.length; i++) {
+            const s = Math.max(-1, Math.min(1, inp[i]));
+            this.pcm[this.ci++] = s < 0 ? s * 32768 : s * 32767;
+            if (this.ci === MIC_CHUNK) {
+              this.port.postMessage(this.pcm.buffer, [this.pcm.buffer]);
+              this.pcm = new Int16Array(MIC_CHUNK);
+              this.ci = 0;
+            }
+          }
+        }
+
+        // --- Reproducción: lee del ring buffer con interpolación lineal y ajuste fino de velocidad ---
+        const out = outputs[0], oL = out[0], oR = out[1] || out[0];
+        const fill = this.w - this.rp;
+        if (!this.playing && fill >= this.target) { this.playing = true; this.g = 0; this.fs = fill; }
+        this.fs += (fill - this.fs) * 0.02;
+        // Compensa la deriva de relojes: ±1 % máx. según cuánto se desvía el nivel del colchón
+        const adj = Math.max(-0.01, Math.min(0.01, (this.fs - this.target) / (this.target * 40)));
+        const step = this.ratio * (1 + adj);
+
+        for (let i = 0; i < oL.length; i++) {
+          let l, r;
+          if (this.playing && this.w - this.rp > 1) {
+            const k = Math.floor(this.rp), f = this.rp - k, a = k & MASK, b = (k + 1) & MASK;
+            l = this.L[a] + f * (this.L[b] - this.L[a]);
+            r = this.R[a] + f * (this.R[b] - this.R[a]);
+            if (this.g < 1) { this.g = Math.min(1, this.g + 0.01); l *= this.g; r *= this.g; }  // fade-in
+            this.rp += step;
+            this.lastL = l; this.lastR = r; this.dk = 1;
+          } else {   // sin datos: la última muestra decae a cero (sin chasquido) y se vuelve a llenar el colchón
+            this.playing = false;
+            l = this.lastL * this.dk; r = this.lastR * this.dk;
+            this.dk *= 0.95;
+          }
+          oL[i] = l; oR[i] = r;
+        }
+
+        // Normaliza los punteros para mantener la precisión decimal en sesiones de muchas horas
+        if (this.rp >= CAP) {
+          this.rp -= CAP;
+          this.w -= CAP;
+        }
+        return true;
+      }
+    }
+    registerProcessor("relay", RelayProcessor);
+  </script>
+
+  <script>
+    const TARGET_MS = 50;           // colchón de jitter: más alto = más estable, más bajo = menos retraso
+    const CONNECT_TIMEOUT_MS = 8000;
+    const KOFI_URL = "";            // <- si agregas un enlace de Ko-fi, aparecerá junto a Patreon
+    const PATREON_URL = "https://patreon.com/Kaell456?utm_medium=unknown&utm_source=join_link&utm_campaign=creatorshare_creator&utm_content=copyLink";
+    const APP_PORT = 8080;          // puerto sin TLS del servidor (lo usa la app Android)
+    const IN_APP = !!window.Capacitor;  // en la APK la página es local: hay que indicar la IP
+
+    let ws = null, audioCtx = null, micStream = null, micSource = null, node = null, wakeLock = null;
+    let state = "idle";             // idle | connecting | connected
+    let speakerEnabled = true;
+    let micEnabled = true;
+    let echoCancel = false;         // anti-eco del navegador: apagado por defecto (audio crudo)
+    let switchingMic = false;
+    let scanning = false;
+
+    const connectBtn = document.getElementById("connectBtn");
+    const btnLabel = document.getElementById("btnLabel");
+    const btnSub = document.getElementById("btnSub");
+    const statusText = document.getElementById("statusText");
+    const toggleSpeakerBtn = document.getElementById("toggleSpeaker");
+    const toggleMicBtn = document.getElementById("toggleMic");
+    const toggleEchoBtn = document.getElementById("toggleEcho");
+    const ipField = document.getElementById("ipField");
+    const ipInput = document.getElementById("serverIp");
+    const scanBtn = document.getElementById("scanBtn");
+    const supportBtn = document.getElementById("supportBtn");
+    const kofiLink = document.getElementById("kofiLink");
+    const patreonLink = document.getElementById("patreonLink");
+
+    ipField.hidden = !IN_APP;
+    try { ipInput.value = localStorage.getItem("serverIp") || ""; } catch (e) {}
+
+    patreonLink.href = PATREON_URL;
+    if (KOFI_URL && !KOFI_URL.includes("TU_USUARIO")) {
+      kofiLink.href = KOFI_URL;
+      supportBtn.textContent = "💜 Apoyar proyecto (Patreon / Ko-fi)";
+    } else {
+      kofiLink.hidden = true;
+      patreonLink.classList.add("full");
+      supportBtn.textContent = "💜 Apoyar proyecto en Patreon";
+    }
+    supportBtn.addEventListener("click", () => {
+      const links = document.getElementById("supportLinks");
+      links.hidden = !links.hidden;
+    });
+
+    const LABELS = {
+      idle: ["CONECTAR", "Toca para iniciar"],
+      connecting: ["CONECTANDO…", "Espera un momento"],
+      connected: ["CONECTADO", "Toca para desconectar"]
+    };
+
+    function setUI(s, text) {
+      connectBtn.disabled = s === "connecting";
+      toggleEchoBtn.disabled = s === "connecting";
+      ipInput.disabled = s !== "idle";
+      scanBtn.disabled = s !== "idle" || scanning;
+      connectBtn.classList.toggle("connected", s === "connected");
+      btnLabel.textContent = LABELS[s][0];
+      btnSub.textContent = LABELS[s][1];
+      if (text) statusText.textContent = text;
+    }
+
+    async function checkServerIp(ip, timeoutMs = 550) {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), timeoutMs);
+      try {
+        const r = await fetch(`http://${ip}:${APP_PORT}/ping`, { signal: ctrl.signal });
+        const data = await r.json();
+        if (data && data.app === "nexoaudio") return data.ip || ip;
+      } catch (e) {} finally {
+        clearTimeout(t);
+      }
+      throw new Error("no_match");
+    }
+
+    async function autoDiscoverServer() {
+      if (!IN_APP || scanning || state !== "idle") return;
+      scanning = true;
+      scanBtn.disabled = true;
+
+      try {
+        const saved = ipInput.value.trim().replace(/^[a-z]+:\/\//i, "").replace(/[:/].*$/, "");
+        // 1. Verifica primero si la IP guardada sigue activa
+        if (/^\d+\.\d+\.\d+\.\d+$/.test(saved)) {
+          try {
+            const verified = await checkServerIp(saved, 500);
+            ipInput.value = verified;
+            try { localStorage.setItem("serverIp", verified); } catch (e) {}
+            statusText.textContent = `Laptop lista en ${verified}`;
+            return;
+          } catch (e) {}
+        }
+
+        // 2. Escanea subredes locales comunes (empezando por la de la última IP guardada)
+        const savedPrefix = saved.match(/^(\d+\.\d+\.\d+)\./)?.[1];
+        const prefixes = [...new Set([savedPrefix, "192.168.1", "192.168.0", "192.168.18", "192.168.100"].filter(Boolean))];
+
+        for (const prefix of prefixes) {
+          if (state !== "idle") return;
+          statusText.textContent = `Buscando laptop en ${prefix}.x...`;
+          for (let base = 1; base < 255; base += 50) {
+            if (state !== "idle") return;
+            const batch = [];
+            for (let i = base; i < Math.min(255, base + 50); i++) {
+              batch.push(checkServerIp(`${prefix}.${i}`));
+            }
+            try {
+              const foundIp = await Promise.any(batch);
+              ipInput.value = foundIp;
+              try { localStorage.setItem("serverIp", foundIp); } catch (e) {}
+              statusText.textContent = `Laptop encontrada en ${foundIp}`;
+              return;
+            } catch (e) {}
+          }
+        }
+        if (state === "idle") {
+          statusText.textContent = "Escribe la IP de tu laptop o toca 🔍 para reintentar";
+        }
+      } finally {
+        scanning = false;
+        scanBtn.disabled = state !== "idle";
+      }
+    }
+
+    scanBtn.addEventListener("click", autoDiscoverServer);
+    if (IN_APP) autoDiscoverServer();
+
+    toggleSpeakerBtn.addEventListener("click", () => {
+      speakerEnabled = !speakerEnabled;
+      toggleSpeakerBtn.textContent = speakerEnabled ? "🔊 Altavoz: ON" : "🔇 Altavoz: OFF";
+      toggleSpeakerBtn.classList.toggle("off", !speakerEnabled);
+      if (node) node.port.postMessage({ type: "flush" });
+    });
+
+    toggleMicBtn.addEventListener("click", () => {
+      micEnabled = !micEnabled;
+      toggleMicBtn.textContent = micEnabled ? "🎙️ Micrófono: ON" : "🚫 Micrófono: OFF";
+      toggleMicBtn.classList.toggle("off", !micEnabled);
+    });
+
+    const micConstraints = () => ({ echoCancellation: echoCancel, noiseSuppression: false, autoGainControl: false, channelCount: 1 });
+    const connectedText = () => `Audio ${echoCancel ? "con anti-eco" : "en crudo"} activo (${audioCtx.sampleRate} Hz)`;
+
+    function renderEcho() {
+      toggleEchoBtn.textContent = echoCancel ? "🎧 Anti-eco: ON" : "🎧 Anti-eco: OFF";
+      toggleEchoBtn.classList.toggle("on", echoCancel);
+    }
+
+    toggleEchoBtn.addEventListener("click", async () => {
+      if (switchingMic) return;
+      echoCancel = !echoCancel;
+      renderEcho();
+      if (state !== "connected" || !micStream) return;   // desconectado: se aplicará al conectar
+
+      // El navegador fija el anti-eco al abrir el micrófono: se reabre y se cambia la fuente sin cortar la sesión
+      switchingMic = true;
+      try {
+        const next = await navigator.mediaDevices.getUserMedia({ audio: micConstraints() });
+        if (state !== "connected") { next.getTracks().forEach((t) => t.stop()); return; }
+        micSource.disconnect();
+        micStream.getTracks().forEach((t) => t.stop());
+        micStream = next;
+        micSource = audioCtx.createMediaStreamSource(micStream);
+        micSource.connect(node);
+        statusText.textContent = connectedText();
+      } catch (err) {
+        echoCancel = !echoCancel;
+        renderEcho();
+        statusText.textContent = "No se pudo cambiar el anti-eco";
+      } finally {
+        switchingMic = false;
+      }
+    });
+
+    connectBtn.addEventListener("click", () => {
+      if (state === "idle") startConnection();
+      else if (state === "connected") stopConnection();
+    });
+
+    async function acquireWakeLock() {
+      if (!("wakeLock" in navigator) || wakeLock) return;
+      try {
+        const lock = await navigator.wakeLock.request("screen");
+        lock.addEventListener("release", () => { if (wakeLock === lock) wakeLock = null; });
+        wakeLock = lock;
+      } catch (e) {}
+    }
+
+    // El navegador libera el Wake Lock y puede suspender el audio al ocultar la pestaña: se recupera al volver
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "visible" || state !== "connected") return;
+      acquireWakeLock();
+      if (audioCtx && audioCtx.state !== "running") audioCtx.resume().catch(() => {});
+    });
+
+    // Libera TODO y deja la UI lista para reconectar. Es seguro llamarla en cualquier estado y varias veces.
+    function stopConnection(msg) {
+      state = "idle";
+      if (ws) {
+        const s = ws;
+        ws = null;
+        s.onopen = s.onmessage = s.onclose = s.onerror = null;
+        try { s.close(1000); } catch (e) {}
+      }
+      if (node) {
+        node.port.onmessage = null;
+        try { node.disconnect(); } catch (e) {}
+        node = null;
+      }
+      if (micSource) {
+        try { micSource.disconnect(); } catch (e) {}
+        micSource = null;
+      }
+      if (micStream) {
+        micStream.getTracks().forEach((t) => t.stop());
+        micStream = null;
+      }
+      if (audioCtx) {
+        audioCtx.close().catch(() => {});
+        audioCtx = null;
+      }
+      if (wakeLock) {
+        wakeLock.release().catch(() => {});
+        wakeLock = null;
+      }
+      setUI("idle", msg || "Listo para conectar a tu Laptop");
+    }
+
+    // Devuelve "IP:puerto" a partir de lo escrito (acepta que peguen la URL completa) y la recuerda
+    function serverHost() {
+      const v = ipInput.value.trim().replace(/^[a-z]+:\/\//i, "").replace(/[:/].*$/, "");
+      if (!/^[\w.-]+$/.test(v)) return "";
+      try { localStorage.setItem("serverIp", v); } catch (e) {}
+      return `${v}:${APP_PORT}`;
+    }
+
+    async function startConnection() {
+      if (state !== "idle") return;   // evita doble clic / sesiones duplicadas
+      if (IN_APP && !serverHost()) {
+        statusText.textContent = "Escribe la IP de tu laptop (ej. 192.168.1.20)";
+        ipInput.focus();
+        return;
+      }
+      state = "connecting";
+      setUI("connecting", "Solicitando acceso al micrófono...");
+
+      try {
+        // 1. AudioContext dentro del gesto del usuario
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        audioCtx = new Ctx({ latencyHint: "interactive" });
+        await audioCtx.resume();
+
+        // 2. Micrófono en crudo (sin filtros que vuelvan la voz metálica)
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: micConstraints()
+        });
+        acquireWakeLock();
+
+        // 3. AudioWorklet cargado desde un Blob (no requiere una segunda petición al servidor)
+        const blobUrl = URL.createObjectURL(
+          new Blob([document.getElementById("relay-worklet").textContent], { type: "application/javascript" })
+        );
+        try { await audioCtx.audioWorklet.addModule(blobUrl); } finally { URL.revokeObjectURL(blobUrl); }
+
+        node = new AudioWorkletNode(audioCtx, "relay", {
+          numberOfInputs: 1,
+          numberOfOutputs: 1,
+          outputChannelCount: [2],
+          channelCount: 1,
+          channelCountMode: "explicit"
+        });
+        node.port.onmessage = onMicChunk;
+        micSource = audioCtx.createMediaStreamSource(micStream);
+        micSource.connect(node);
+        node.connect(audioCtx.destination);
+
+        // 4. WebSocket
+        setUI("connecting", "Conectando con la laptop...");
+        openSocket();
+      } catch (err) {
+        stopConnection("Error: " + (err.message || "Permiso de micrófono denegado"));
+      }
+    }
+
+    function openSocket() {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      const url = IN_APP ? `ws://${serverHost()}/ws` : `${proto}//${location.host}/ws`;
+      const sock = new WebSocket(url);
+      sock.binaryType = "arraybuffer";
+      ws = sock;
+
+      sock.onopen = () => {
+        state = "connected";
+        setUI("connected", connectedText());
+        // Debe ir antes del primer paquete de micrófono: el servidor remuestrea según esta frecuencia
+        sock.send(JSON.stringify({ type: "client_config", mic_rate: audioCtx.sampleRate }));
+      };
+      sock.onmessage = onSocketMessage;
+
+      const dropped = (e) => stopConnection(
+        e && e.reason === "replaced" ? "Otro dispositivo tomó la sesión"
+          : state === "connected" ? "Conexión perdida con la laptop"
+          : "No se pudo conectar: revisa la IP y que ambos estén en la misma red"
+      );
+      sock.onclose = dropped;
+      sock.onerror = dropped;
+
+      setTimeout(() => {
+        if (ws === sock && state === "connecting") stopConnection("Tiempo de espera agotado");
+      }, CONNECT_TIMEOUT_MS);
+    }
+
+    function onSocketMessage(event) {
+      if (typeof event.data === "string") {
+        let msg;
+        try { msg = JSON.parse(event.data); } catch (e) { return; }
+        if (msg.type === "config" && node) {
+          node.port.postMessage({ type: "cfg", rate: msg.pc_rate, channels: msg.pc_channels, targetMs: TARGET_MS });
+          if (!msg.vbcable_active) {
+            statusText.textContent = "Conectado (Altavoz activo | VB-Cable no detectado en PC)";
+          }
+        }
+        return;
+      }
+      if (!speakerEnabled || !node) return;
+      node.port.postMessage({ type: "pcm", buf: event.data }, [event.data]);
+    }
+
+    function onMicChunk(e) {
+      if (!micEnabled || !ws || ws.readyState !== WebSocket.OPEN) return;
+      if (ws.bufferedAmount > 16384) return;   // red atascada: descarta en vez de acumular retraso
+      ws.send(e.data);
+    }
+  </script>
+</body>
+</html>
