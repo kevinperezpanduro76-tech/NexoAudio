@@ -58,11 +58,39 @@ build.bat
 ```
 
 #### Build Android APK (Capacitor)
-```bash
+
+The `android/` project is **not stored in the repository**: it is generated with `npx cap add android`, and then the files in `android-overlay/` (permissions in `AndroidManifest.xml`) are copied on top of it.
+
+**Option 1: GitHub Actions (easiest, nothing to install)**
+1. Go to the **Actions** tab of the repository.
+2. Open the latest run of **Build NexoAudio (Windows EXE + Android APK)**, or start a new one with **Run workflow**.
+3. When the **Android App (.apk)** job finishes, download the **NexoAudio-Android-APK** artifact (a `.zip` containing `NexoAudio.apk`).
+
+**Option 2: Build locally**
+
+Requirements: Node.js 18+ (20 recommended), JDK 17 and the Android SDK (installed with Android Studio).
+
+```cmd
 npm install
-npm run sync
-npm run open:android
+npm run copy:web
+npx cap add android
+xcopy android-overlay android /E /Y /I
+npx cap sync android
+cd android
+gradlew assembleDebug
 ```
+
+On Linux/macOS, replace the `xcopy` line with `cp -r android-overlay/* android/` and use `./gradlew assembleDebug`.
+
+The APK will be at:
+
+```
+android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+Notes:
+* Run `npx cap add android` only once. After the `android/` folder exists, you can use `npm run sync` to refresh the web assets, or `npm run open:android` to open the project in Android Studio.
+* This is a debug APK (signed with the debug key). To distribute a release build you need to sign it with your own keystore.
 
 ### Troubleshooting
 
@@ -130,11 +158,39 @@ build.bat
 ```
 
 #### Compilar Aplicación Android (.apk)
-```bash
+
+El proyecto `android/` **no está guardado en el repositorio**: se genera con `npx cap add android` y luego se copian encima los archivos de `android-overlay/` (permisos en `AndroidManifest.xml`).
+
+**Opción 1: GitHub Actions (la más fácil, sin instalar nada)**
+1. Entra a la pestaña **Actions** del repositorio.
+2. Abre la última ejecución de **Build NexoAudio (Windows EXE + Android APK)**, o inicia una nueva con **Run workflow**.
+3. Cuando termine el job **Android App (.apk)**, descarga el artifact **NexoAudio-Android-APK** (un `.zip` que contiene `NexoAudio.apk`).
+
+**Opción 2: Compilar en tu PC**
+
+Requisitos: Node.js 18+ (recomendado 20), JDK 17 y el Android SDK (se instala con Android Studio).
+
+```cmd
 npm install
-npm run sync
-npm run open:android
+npm run copy:web
+npx cap add android
+xcopy android-overlay android /E /Y /I
+npx cap sync android
+cd android
+gradlew assembleDebug
 ```
+
+En Linux/macOS, reemplaza la línea de `xcopy` por `cp -r android-overlay/* android/` y usa `./gradlew assembleDebug`.
+
+El APK quedará en:
+
+```
+android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+Notas:
+* Ejecuta `npx cap add android` solo una vez. Cuando la carpeta `android/` ya exista, puedes usar `npm run sync` para actualizar los archivos web, o `npm run open:android` para abrir el proyecto en Android Studio.
+* Este es un APK debug (firmado con la clave de depuración). Para distribuir una versión release necesitas firmarlo con tu propio keystore.
 
 ### Solución de Problemas Comunes
 
@@ -149,4 +205,4 @@ npm run open:android
 
 ## License / Licencia
 
-MIT License.*
+MIT License.
