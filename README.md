@@ -1,21 +1,21 @@
-# 🎧 NexoAudio
+# NexoAudio
 
 **NexoAudio** es un puente de audio bidireccional en tiempo real y de baja latencia entre tu PC (Windows) y tu celular (Android o navegador móvil) a través de tu red local Wi-Fi o zona portátil (*mobile hotspot*).
 
 Convierte tu teléfono en unos audífonos inalámbricos para escuchar todo lo que suena en tu PC y, al mismo tiempo, usa el micrófono de tu celular como micrófono inalámbrico para Discord, juegos, llamadas o streaming.
 
-## ✨ Características principales
+## Características principales
 
-* **🔊 Audio de PC a Celular:** Captura el sonido del escritorio mediante **WASAPI Loopback** (con soporte de mezcla automática de 5.1 a estéreo) y lo reproduce en el móvil sin retraso perceptible.
-* **🎙️ Micrófono de Celular a PC:** Transmite tu voz hacia Windows a través de **VB-Cable**, priorizando frecuencias de 48 kHz en WASAPI para evitar remuestreos innecesarios.
-* **⚡ Motor de latencia ultrabaja:** Construido sobre un `AudioWorklet` personalizado con *ring buffer*, colchón de *jitter* de 50 ms, interpolación lineal y ajuste dinámico de velocidad (±1 %) para compensar la deriva de relojes sin cortes ni chasquidos.
-* **🎛️ Controles en vivo:** Activa o silencia el altavoz y el micrófono al instante, o alterna entre **audio en crudo** y **cancelación de eco (Anti-eco)** en caliente sin desconectar la sesión.
-* **📱 Doble vía de conexión:**
+* **Audio de PC a Celular:** Captura el sonido del escritorio mediante **WASAPI Loopback** (con soporte de mezcla automática de 5.1 a estéreo) y lo reproduce en el móvil sin retraso perceptible.
+* **Micrófono de Celular a PC:** Transmite tu voz hacia Windows a través de **VB-Cable**, priorizando frecuencias de 48 kHz en WASAPI para evitar remuestreos innecesarios.
+* ** Motor de latencia ultrabaja:** Construido sobre un `AudioWorklet` personalizado con *ring buffer*, colchón de *jitter* de 50 ms, interpolación lineal y ajuste dinámico de velocidad (±1 %) para compensar la deriva de relojes sin cortes ni chasquidos.
+* ** Controles en vivo:** Activa o silencia el altavoz y el micrófono al instante, o alterna entre **audio en crudo** y **cancelación de eco (Anti-eco)** en caliente sin desconectar la sesión.
+* ** Doble vía de conexión:**
   * **Sin instalar nada (Web):** Escanea el código QR de la consola para abrir la interfaz web por HTTPS (puerto 8443).
   * **App Android nativa:** Conecta mediante HTTP (puerto 8080) con **autodescubrimiento de IP** en la red local.
-* **🔋 Pantalla activa:** Integración con `Wake Lock API` y recuperación automática de sesión al volver a la aplicación.
+* ** Pantalla activa:** Integración con `Wake Lock API` y recuperación automática de sesión al volver a la aplicación.
 
-## 🚀 Guía de uso rápido
+## Guía de uso rápido
 
 ### 1. En tu PC (Windows 10/11)
 1. *(Opcional pero recomendado)* Si quieres usar el micrófono de tu celular en la PC, descarga e instala **[VB-Cable](https://vb-audio.com/Cable/)** y reinicia tu PC.
@@ -26,7 +26,7 @@ Convierte tu teléfono en unos audífonos inalámbricos para escuchar todo lo qu
 
 #### Opción A: Desde la App de Android (APK)
 1. Instala `NexoAudio.apk` en tu teléfono (asegúrate de estar en la misma red Wi-Fi que tu PC).
-2. Al abrir la app, buscará automáticamente la IP de tu laptop en la red local. Si no la detecta, escríbela manualmente o toca el botón **🔍**.
+2. Al abrir la app, buscará automáticamente la IP de tu laptop en la red local. Si no la detecta, escríbela manualmente o toca el botón ****.
 3. Toca **CONECTAR** y acepta el permiso de micrófono.
 
 #### Opción B: Desde el navegador (Chrome / Safari / Edge)
