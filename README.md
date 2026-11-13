@@ -1,4 +1,5 @@
 # NexoAudio
+
 [English](#english) | [Español](#español)
 
 ---
@@ -9,6 +10,13 @@
 **NexoAudio** is a real-time, low-latency bidirectional audio bridge between your Windows PC and your phone (Android app or mobile browser) over a local Wi-Fi network or mobile hotspot.
 
 Turn your phone into a wireless speaker/headset to listen to your PC audio and, simultaneously, use your phone's microphone as a wireless microphone for Discord, games, calls, or streaming.
+
+### Downloads (Ready to Use)
+
+You do not need to compile the code to use NexoAudio. Download the latest pre-built installers directly from the **[GitHub Releases page](https://github.com/kevinperezpanduro76-tech/NexoAudio/releases/latest)**:
+
+* **Windows PC (`NexoAudio.exe`):** Standalone server executable (no Python installation required).
+* **Android Phone (`NexoAudio.apk`):** Native Android application with automatic local IP discovery.
 
 ### Key Features
 
@@ -25,13 +33,13 @@ Turn your phone into a wireless speaker/headset to listen to your PC audio and, 
 
 #### 1. On your PC (Windows 10/11)
 1. *(Optional, required for microphone forwarding)* Download and install **[VB-Cable](https://vb-audio.com/Cable/)**, then restart your PC.
-2. Run `NexoAudio.exe` (from **Actions / Releases**) or start the server from source using `python server.py`.
+2. Download and run **`NexoAudio.exe`** from **[Releases](https://github.com/kevinperezpanduro76-tech/NexoAudio/releases/latest)** (or start the server from source using `python server.py`).
 3. If prompted by **Windows Defender Firewall**, allow access on **Private networks**.
 
 #### 2. On your Phone
 
 ##### Option A: Android App (APK)
-1. Install `NexoAudio.apk` on your phone (make sure both devices are on the same Wi-Fi network or hotspot).
+1. Download and install **`NexoAudio.apk`** from **[Releases](https://github.com/kevinperezpanduro76-tech/NexoAudio/releases/latest)** on your phone (make sure both devices are on the same Wi-Fi network or hotspot).
 2. Open the app. It will automatically scan the local network for your PC's IP address, or you can enter it manually.
 3. Tap **CONECTAR** and grant microphone permissions.
 
@@ -58,17 +66,16 @@ build.bat
 ```
 
 #### Build Android APK (Capacitor)
-
-The `android/` project is **not stored in the repository**: it is generated with `npx cap add android`, and then the files in `android-overlay/` (permissions in `AndroidManifest.xml`) are copied on top of it.
+The `android/` project is not stored in the repository: it is generated with `npx cap add android`, and then the files in `android-overlay/` (permissions in `AndroidManifest.xml`) are copied on top of it.
 
 **Option 1: GitHub Actions (easiest, nothing to install)**
 1. Go to the **Actions** tab of the repository.
 2. Open the latest run of **Build NexoAudio (Windows EXE + Android APK)**, or start a new one with **Run workflow**.
-3. When the **Android App (.apk)** job finishes, download the **NexoAudio-Android-APK** artifact (a `.zip` containing `NexoAudio.apk`).
+3. When the **Android App (.apk)** job finishes, download the `NexoAudio-Android-APK` artifact (a `.zip` containing `NexoAudio.apk`).
 
 **Option 2: Build locally**
 
-Requirements: Node.js 18+ (20 recommended), JDK 17 and the Android SDK (installed with Android Studio).
+Requirements: Node.js 18+ (20 recommended), JDK 17, and the Android SDK (installed with Android Studio).
 
 ```cmd
 npm install
@@ -83,12 +90,11 @@ gradlew assembleDebug
 On Linux/macOS, replace the `xcopy` line with `cp -r android-overlay/* android/` and use `./gradlew assembleDebug`.
 
 The APK will be at:
-
-```
+```text
 android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Notes:
+**Notes:**
 * Run `npx cap add android` only once. After the `android/` folder exists, you can use `npm run sync` to refresh the web assets, or `npm run open:android` to open the project in Android Studio.
 * This is a debug APK (signed with the debug key). To distribute a release build you need to sign it with your own keystore.
 
@@ -110,6 +116,13 @@ Notes:
 
 Convierte tu teléfono en unos audífonos o altavoces inalámbricos para escuchar todo lo que suena en tu PC y, al mismo tiempo, usa el micrófono de tu celular como micrófono inalámbrico para Discord, juegos, llamadas o streaming.
 
+### Descargas (Listo para Usar)
+
+No necesitas compilar el código para usar NexoAudio. Descarga los instaladores listos para abrir directamente desde la sección **[Releases de GitHub](https://github.com/kevinperezpanduro76-tech/NexoAudio/releases/latest)**:
+
+* **PC Windows (`NexoAudio.exe`):** Servidor ejecutable portátil (no requiere instalar Python).
+* **Celular Android (`NexoAudio.apk`):** Aplicación nativa para Android con detección automática de IP en red local.
+
 ### Características Principales
 
 * **Audio de PC a Celular:** Captura el sonido del escritorio mediante **WASAPI Loopback** (con soporte de mezcla automática de 5.1 a estéreo) y lo reproduce en el móvil sin retraso perceptible.
@@ -125,13 +138,13 @@ Convierte tu teléfono en unos audífonos o altavoces inalámbricos para escucha
 
 #### 1. En tu PC (Windows 10/11)
 1. *(Opcional, requerido para usar el micrófono)* Descarga e instala **[VB-Cable](https://vb-audio.com/Cable/)** y reinicia tu PC.
-2. Ejecuta `NexoAudio.exe` (descargado desde **Actions / Releases**) o inicia el servidor con `python server.py`.
+2. Descarga y ejecuta **`NexoAudio.exe`** desde **[Releases](https://github.com/kevinperezpanduro76-tech/NexoAudio/releases/latest)** (o inicia el servidor desde el código fuente con `python server.py`).
 3. Si aparece una alerta del **Firewall de Windows**, marca la casilla de **Redes privadas** y permite el acceso.
 
 #### 2. En tu Celular
 
 ##### Opción A: Desde la App de Android (APK)
-1. Instala `NexoAudio.apk` en tu teléfono (asegúrate de estar en la misma red Wi-Fi o zona portátil que tu PC).
+1. Descarga e instala **`NexoAudio.apk`** desde **[Releases](https://github.com/kevinperezpanduro76-tech/NexoAudio/releases/latest)** en tu teléfono (asegúrate de estar en la misma red Wi-Fi o zona portátil que tu PC).
 2. Al abrir la app, buscará automáticamente la IP de tu laptop en la red local. Si no la detecta, escríbela manualmente.
 3. Toca **CONECTAR** y acepta el permiso de micrófono.
 
@@ -158,13 +171,12 @@ build.bat
 ```
 
 #### Compilar Aplicación Android (.apk)
-
-El proyecto `android/` **no está guardado en el repositorio**: se genera con `npx cap add android` y luego se copian encima los archivos de `android-overlay/` (permisos en `AndroidManifest.xml`).
+El proyecto `android/` no está guardado en el repositorio: se genera con `npx cap add android` y luego se copian encima los archivos de `android-overlay/` (permisos en `AndroidManifest.xml`).
 
 **Opción 1: GitHub Actions (la más fácil, sin instalar nada)**
 1. Entra a la pestaña **Actions** del repositorio.
 2. Abre la última ejecución de **Build NexoAudio (Windows EXE + Android APK)**, o inicia una nueva con **Run workflow**.
-3. Cuando termine el job **Android App (.apk)**, descarga el artifact **NexoAudio-Android-APK** (un `.zip` que contiene `NexoAudio.apk`).
+3. Cuando termine el trabajo **Android App (.apk)**, descarga el artefacto `NexoAudio-Android-APK` (un `.zip` que contiene `NexoAudio.apk`).
 
 **Opción 2: Compilar en tu PC**
 
@@ -183,12 +195,11 @@ gradlew assembleDebug
 En Linux/macOS, reemplaza la línea de `xcopy` por `cp -r android-overlay/* android/` y usa `./gradlew assembleDebug`.
 
 El APK quedará en:
-
-```
+```text
 android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Notas:
+**Notas:**
 * Ejecuta `npx cap add android` solo una vez. Cuando la carpeta `android/` ya exista, puedes usar `npm run sync` para actualizar los archivos web, o `npm run open:android` para abrir el proyecto en Android Studio.
 * Este es un APK debug (firmado con la clave de depuración). Para distribuir una versión release necesitas firmarlo con tu propio keystore.
 
@@ -201,6 +212,11 @@ Notas:
 ### Apoya el Proyecto
 * **[Apoyar en Patreon (Kaell456)](https://patreon.com/Kaell456)**
 
+---
+
+## License / Licencia
+
+MIT License.
 ---
 
 ## License / Licencia
