@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtensionOID, NameOID
 
 PORT = 8443
-CHUNK_FRAMES = 1024   # captura loopback (~21 ms)
+CHUNK_FRAMES = 480    # captura loopback (~10 ms para flujo continuo sin tirones)
 MIC_FRAMES = 480      # salida a VB-Cable (~10 ms)
 HEARTBEAT_SEC = 8     # ping al celular; si no responde, se cierra la sesión zombi
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -28,7 +28,7 @@ FROZEN = getattr(sys, "frozen", False)
 APP_DIR = os.path.dirname(sys.executable) if FROZEN else BASE_DIR   # junto al .exe: cert.pem y key.pem persisten
 RES_DIR = getattr(sys, "_MEIPASS", BASE_DIR)                        # recursos empaquetados (index.html)
 
-mic_queue = queue.Queue(maxsize=8)
+mic_queue = queue.Queue(maxsize=24)
 main_loop = None
 active_ws = None   # única sesión activa
 pc_queue = None    # cola de audio PC -> celular de la sesión activa
@@ -254,7 +254,7 @@ class AudioEngine:
             frac = pos - idx
             s0 = prev if idx == 0 else samples[idx - 1]
             s1 = samples[idx]
-            val = int(s0 + frac * (s1 - s0))
+            val = max(-32768, min(32767, int(s0 + frac * (s1 - s0))))
             append(val)
             if out_channels == 2:
                 append(val)
@@ -386,7 +386,16 @@ async def websocket_handler(request):
     ws = web.WebSocketResponse(heartbeat=HEARTBEAT_SEC, max_msg_size=1 << 16)
     await ws.prepare(request)
 
-    q = asyncio.Queue(maxsize=8)
+    # Desactiva el algoritmo de Nagle (TCP_NODELAY) para enviar cada paquete de audio al instante sin tirones
+    if request.transport is not None:
+        raw_sock = request.transport.get_extra_info("socket")
+        if raw_sock is not None:
+            try:
+                raw_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+
+    q = asyncio.Queue(maxsize=32)
 
     # Sesión única: la conexión nueva reemplaza a la anterior
     old, active_ws, pc_queue = active_ws, ws, q
