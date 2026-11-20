@@ -7,6 +7,7 @@ import socket
 import ssl
 import sys
 import threading
+import time
 from array import array
 from datetime import datetime, timedelta, timezone
 
@@ -19,25 +20,41 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtensionOID, NameOID
 
 PORT = 8443
-CHUNK_FRAMES = 480    # captura loopback (~10 ms para flujo continuo sin tirones)
-MIC_FRAMES = 480      # salida a VB-Cable (~10 ms)
-HEARTBEAT_SEC = 8     # ping al celular; si no responde, se cierra la sesión zombi
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 HTTP_PORT = 8080      # puerto sin TLS para la app Android (HTTP + WebSocket + UDP Discovery)
+HEARTBEAT_SEC = 10    # ping al celular; si no responde, cierra sesiones zombi
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FROZEN = getattr(sys, "frozen", False)
-APP_DIR = os.path.dirname(sys.executable) if FROZEN else BASE_DIR   # junto al .exe: cert.pem y key.pem persisten
-RES_DIR = getattr(sys, "_MEIPASS", BASE_DIR)                        # recursos empaquetados (index.html)
+APP_DIR = os.path.dirname(sys.executable) if FROZEN else BASE_DIR
+RES_DIR = getattr(sys, "_MEIPASS", BASE_DIR)
 
-mic_queue = queue.Queue(maxsize=24)
+VBCABLE_KEYWORDS = ("cable input", "vb-audio", "voicemeeter input", "voice meeter input")
+
+mic_queue = queue.Queue(maxsize=40)
 main_loop = None
-active_ws = None   # única sesión activa
-pc_queue = None    # cola de audio PC -> celular de la sesión activa
+active_ws = None
+pc_queue = None
+
+
+def _ip_priority(ip_str: str) -> int:
+    """Prioriza IPs LAN domésticas/hotspot reales sobre adaptadores VPN/virtuales."""
+    if ip_str.startswith("192.168."):
+        return 0
+    if ip_str.startswith("10."):
+        return 1
+    if ip_str.startswith("172."):
+        try:
+            second = int(ip_str.split(".")[1])
+            if 16 <= second <= 31:
+                return 2
+        except Exception:
+            pass
+    return 3
 
 
 def get_all_local_ips():
-    """Devuelve todas las direcciones IPv4 privadas activas de la PC (Wi-Fi, Ethernet, Zona portátil)."""
+    """Devuelve todas las direcciones IPv4 privadas activas de la PC ordenadas por prioridad LAN."""
     ips = []
-    for target in (("8.8.8.8", 80), ("192.168.137.1", 80), ("192.168.43.1", 80), ("192.168.1.1", 80)):
+    for target in (("192.168.1.1", 80), ("192.168.0.1", 80), ("192.168.137.1", 80), ("192.168.43.1", 80), ("8.8.8.8", 80)):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(target)
@@ -54,11 +71,11 @@ def get_all_local_ips():
                 ips.append(ip)
     except Exception:
         pass
+    ips.sort(key=_ip_priority)
     return ips or ["127.0.0.1"]
 
 
 def get_local_ip():
-    """Obtiene la IP local principal de la tarjeta Wi-Fi/Ethernet/Hotspot activa."""
     return get_all_local_ips()[0]
 
 
@@ -77,7 +94,6 @@ class UdpDiscoveryProtocol(asyncio.DatagramProtocol):
 
 
 def _cert_matches_ip(cert_path: str, local_ip: str) -> bool:
-    """Verifica que el certificado exista, sea vigente y contenga la IP local actual en su SAN."""
     try:
         with open(cert_path, "rb") as f:
             cert = x509.load_pem_x509_certificate(f.read())
@@ -93,11 +109,10 @@ def _cert_matches_ip(cert_path: str, local_ip: str) -> bool:
 
 
 def ensure_ssl_certs(local_ip, cert_path=os.path.join(APP_DIR, "cert.pem"), key_path=os.path.join(APP_DIR, "key.pem")):
-    """Genera o actualiza el certificado SSL autofirmado si no existe o si cambió la IP local."""
     if os.path.exists(cert_path) and os.path.exists(key_path) and _cert_matches_ip(cert_path, local_ip):
         return cert_path, key_path
 
-    print(f"[*] Generando certificado HTTPS local para {local_ip} (requerido por navegadores móviles para el micrófono)...")
+    print(f"[*] Generando certificado HTTPS local para {local_ip}...")
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "NexoAudio")])
     now = datetime.now(timezone.utc)
@@ -142,22 +157,32 @@ def ensure_ssl_certs(local_ip, cert_path=os.path.join(APP_DIR, "cert.pem"), key_
     return cert_path, key_path
 
 
+def is_vbcable_name(name: str) -> bool:
+    low = (name or "").lower()
+    return any(k in low for k in VBCABLE_KEYWORDS)
+
+
 def find_vbcable_devices(p: pyaudio.PyAudio):
-    """Dispositivos de salida de VB-Cable, con los de la API WASAPI primero (menor latencia que MME)."""
-    keywords = ("cable input", "vb-audio", "voicemeeter input", "voice meeter input")
-    try:
-        wasapi_idx = p.get_host_api_info_by_type(pyaudio.paWASAPI)["index"]
-    except Exception:
-        wasapi_idx = None
+    """Lista salidas VB-Cable priorizando WASAPI > DirectSound > MME."""
+    api_order = {}
+    for rank, api_type in enumerate((pyaudio.paWASAPI, pyaudio.paDirectSound, pyaudio.paMME)):
+        try:
+            api_order[p.get_host_api_info_by_type(api_type)["index"]] = rank
+        except Exception:
+            pass
 
     found = []
     for i in range(p.get_device_count()):
         dev = p.get_device_info_by_index(i)
         if dev.get("maxOutputChannels", 0) <= 0 or dev.get("isLoopbackDevice", False):
             continue
-        if any(k in dev.get("name", "").lower() for k in keywords):
+        name = dev.get("name", "").lower()
+        if "cable output" in name:
+            continue
+        if any(k in name for k in VBCABLE_KEYWORDS):
             found.append(dev)
-    found.sort(key=lambda d: d.get("hostApi") != wasapi_idx)  # orden estable: WASAPI antes que el resto
+
+    found.sort(key=lambda d: api_order.get(d.get("hostApi"), 99))
     return found
 
 
@@ -170,7 +195,7 @@ def drain(q, empty_exc):
 
 
 def broadcast_pc_audio(data: bytes):
-    """Envía el bloque de audio de la PC al celular activo sin acumular retraso."""
+    """Encola audio de la PC hacia el celular activo descartando paquetes viejos si hay atasco."""
     q = pc_queue
     if q is None:
         return
@@ -185,50 +210,289 @@ def broadcast_pc_audio(data: bytes):
         pass
 
 
+def float32_to_int16(raw_bytes: bytes) -> array:
+    floats = array("f")
+    floats.frombytes(raw_bytes[: len(raw_bytes) & ~3])
+    out = array("h", (max(-32768, min(32767, int(v * 32767.0))) for v in floats))
+    return out
+
+
+def int16_to_float32_bytes(samples: array) -> bytes:
+    out = array("f", (v / 32768.0 for v in samples))
+    return out.tobytes()
+
+
+def normalize_pc_audio(raw_bytes: bytes, fmt: int, channels: int, decim: int) -> bytes:
+    """Convierte audio capturado de la PC a Int16 estéreo y reduce 96k/192k para no saturar el Wi-Fi."""
+    if fmt == pyaudio.paInt16 and channels == 2 and decim == 1:
+        return raw_bytes
+
+    if fmt == pyaudio.paFloat32:
+        samples = float32_to_int16(raw_bytes)
+    else:
+        samples = array("h")
+        samples.frombytes(raw_bytes[: len(raw_bytes) & ~1])
+
+    total = len(samples)
+    if total == 0:
+        return b""
+
+    if channels == 1:
+        stereo = array("h", [0]) * (total * 2)
+        stereo[0::2] = samples
+        stereo[1::2] = samples
+    elif channels == 2:
+        stereo = samples
+    elif channels >= 6:
+        frames = total // channels
+        stereo = array("h", [0]) * (frames * 2)
+        has_side = channels >= 8
+        for i in range(frames):
+            o = i * channels
+            c = samples[o + 2] * 0.7071
+            l_val = samples[o] + c + samples[o + 4] * 0.7071
+            r_val = samples[o + 1] + c + samples[o + 5] * 0.7071
+            if has_side:
+                l_val += samples[o + 6] * 0.7071
+                r_val += samples[o + 7] * 0.7071
+                scale = 0.45
+            else:
+                scale = 0.58
+            stereo[i * 2] = max(-32768, min(32767, int(l_val * scale)))
+            stereo[i * 2 + 1] = max(-32768, min(32767, int(r_val * scale)))
+    else:
+        frames = total // channels
+        stereo = array("h", [0]) * (frames * 2)
+        for i in range(frames):
+            o = i * channels
+            stereo[i * 2] = samples[o]
+            stereo[i * 2 + 1] = samples[o + 1]
+
+    if decim > 1:
+        step = 2 * decim
+        l_ch = stereo[0::step]
+        r_ch = stereo[1::step]
+        n_out = min(len(l_ch), len(r_ch))
+        reduced = array("h", [0]) * (n_out * 2)
+        reduced[0::2] = l_ch[:n_out]
+        reduced[1::2] = r_ch[:n_out]
+        return reduced.tobytes()
+
+    return stereo.tobytes()
+
+
 class AudioEngine:
     def __init__(self):
-        self.p = pyaudio.PyAudio()
+        self.p = None
         self.loopback_stream = None
         self.mic_stream = None
+        self._mic_lock = threading.Lock()
+        self._worker_started = False
 
-        # 1. Captura de audio de PC (WASAPI Loopback)
-        self.loopback_dev = self.p.get_default_wasapi_loopback()
-        self.pc_rate = int(self.loopback_dev["defaultSampleRate"])
-        self.pc_channels = int(self.loopback_dev["maxInputChannels"])
+        # Estado de captura de PC
+        self.loopback_dev = None
+        self.loopback_is_vbcable = False
+        self.pc_fmt = pyaudio.paInt16
+        self.pc_raw_rate = 48000
+        self.pc_raw_channels = 2
+        self.pc_decim = 1
+        self.pc_rate = 48000       # frecuencia efectiva enviada al celular
+        self.pc_channels = 2       # siempre enviamos estéreo al celular
 
-        # 2. Salida hacia Micrófono Virtual (VB-Cable)
+        # Estado de micrófono virtual (VB-Cable)
         self.cable_dev = None
+        self.mic_fmt = pyaudio.paInt16
         self.mic_rate = 48000
-        self.mic_channels = 1
-        self.client_rate = 48000  # frecuencia del micrófono del celular activo
+        self.mic_channels = 2
+        self.client_rate = 48000
 
-        # Estado continuo del resampler (solo lo usa el hilo escritor)
+        # Estado del resampler y diagnóstico de señal
         self.resample_pos = 0.0
         self.prev_sample = 0
+        self._seen_pc_signal = False
+        self._seen_mic_signal = False
+        self._last_mic_reopen = 0.0
 
-    def reset_resampler(self):
+    def reset_session_state(self):
         self.resample_pos = 0.0
         self.prev_sample = 0
+        self._seen_pc_signal = False
+        self._seen_mic_signal = False
 
-    def set_loopback_active(self, active: bool):
-        """Activa o pausa la captura WASAPI según haya un cliente conectado."""
-        if not self.loopback_stream:
-            return
+    def _compute_decim(self, rate: int):
+        """Reduce frecuencias de estudio (96k/192k/88.2k/176.4k) a <=48k para evitar cortes por Wi-Fi."""
+        for factor in (4, 2):
+            if rate > 48000 and rate % factor == 0 and (rate // factor) <= 48000:
+                return factor, rate // factor
+        return 1, rate
+
+    def _get_candidate_loopbacks(self):
+        candidates = []
+        default_lb = None
         try:
-            if active and self.loopback_stream.is_stopped():
-                self.loopback_stream.start_stream()
-            elif not active and self.loopback_stream.is_active():
-                self.loopback_stream.stop_stream()
+            default_lb = self.p.get_default_wasapi_loopback()
+            if default_lb:
+                candidates.append(default_lb)
+        except Exception as e:
+            print(f"[!] No se pudo obtener el altavoz WASAPI predeterminado: {e}")
+
+        try:
+            for dev in self.p.get_loopback_device_info_generator():
+                if not default_lb or dev["index"] != default_lb["index"]:
+                    candidates.append(dev)
         except Exception:
             pass
+        return candidates
+
+    def _open_loopback_stream(self):
+        def loopback_callback(in_data, frame_count, time_info, status):
+            if pc_queue is not None and main_loop is not None:
+                try:
+                    main_loop.call_soon_threadsafe(broadcast_pc_audio, in_data)
+                except RuntimeError:
+                    pass
+            return (None, pyaudio.paContinue)
+
+        for dev in self._get_candidate_loopbacks():
+            raw_rate = int(dev.get("defaultSampleRate", 48000)) or 48000
+            max_ch = max(1, int(dev.get("maxInputChannels", 2)))
+            chunk_20ms = max(480, int(raw_rate * 0.02))
+            ch_options = list(dict.fromkeys([max_ch, 2, 1]))
+            ch_options = [c for c in ch_options if 1 <= c <= max_ch]
+
+            for fmt in (pyaudio.paInt16, pyaudio.paFloat32):
+                for ch in ch_options:
+                    for fpb in (chunk_20ms, 0):
+                        try:
+                            stream = self.p.open(
+                                format=fmt,
+                                channels=ch,
+                                rate=raw_rate,
+                                input=True,
+                                start=False,
+                                frames_per_buffer=fpb,
+                                input_device_index=dev["index"],
+                                stream_callback=loopback_callback,
+                            )
+                        except Exception:
+                            continue
+
+                        decim, eff_rate = self._compute_decim(raw_rate)
+                        self.loopback_dev = dev
+                        self.loopback_is_vbcable = is_vbcable_name(dev.get("name", ""))
+                        self.pc_fmt = fmt
+                        self.pc_raw_rate = raw_rate
+                        self.pc_raw_channels = ch
+                        self.pc_decim = decim
+                        self.pc_rate = eff_rate
+                        self.pc_channels = 2
+                        self.loopback_stream = stream
+                        return True
+        return False
+
+    def _open_mic_stream(self):
+        """Abre VB-Cable priorizando WASAPI con su frecuencia y canales nativos (evita errores en otras PCs)."""
+        try:
+            wasapi_idx = self.p.get_host_api_info_by_type(pyaudio.paWASAPI)["index"]
+        except Exception:
+            wasapi_idx = None
+
+        for dev in find_vbcable_devices(self.p):
+            default_rate = int(dev.get("defaultSampleRate", 48000)) or 48000
+            max_ch = max(1, int(dev.get("maxOutputChannels", 2)))
+            is_wasapi = dev.get("hostApi") == wasapi_idx
+
+            # En WASAPI compartido conviene abrir primero en la frecuencia nativa configurada en Windows
+            candidate_rates = list(dict.fromkeys([default_rate, 48000, 44100]))
+            candidate_ch = list(dict.fromkeys([c for c in (2, 1, max_ch) if 1 <= c <= max_ch]))
+
+            for fmt in (pyaudio.paInt16, pyaudio.paFloat32):
+                for rate in candidate_rates:
+                    frames = max(480, int(rate * (0.02 if is_wasapi else 0.04)))
+                    for ch in candidate_ch:
+                        for fpb in (frames, 0):
+                            try:
+                                stream = self.p.open(
+                                    format=fmt,
+                                    channels=ch,
+                                    rate=rate,
+                                    output=True,
+                                    start=False,
+                                    frames_per_buffer=fpb,
+                                    output_device_index=dev["index"],
+                                )
+                            except Exception:
+                                continue
+                            self.cable_dev = dev
+                            self.mic_fmt = fmt
+                            self.mic_rate = rate
+                            self.mic_channels = ch
+                            self.mic_stream = stream
+                            return True
+        return False
+
+    def start(self):
+        self.p = pyaudio.PyAudio()
+
+        if self._open_loopback_stream():
+            fmt_name = "Float32" if self.pc_fmt == pyaudio.paFloat32 else "Int16"
+            print(
+                f"[OK] Captura de PC lista (Loopback): {self.loopback_dev['name']} "
+                f"({self.pc_raw_rate}Hz -> {self.pc_rate}Hz, {self.pc_raw_channels}ch -> 2ch, {fmt_name})"
+            )
+            if self.loopback_is_vbcable:
+                print(
+                    "[!] ALERTA: Tu altavoz predeterminado en Windows es VB-Cable ('CABLE Input').\n"
+                    "    Eso causa eco o silencio. Cambia la salida de Windows a tus Altavoces/Audífonos reales\n"
+                    "    y vuelve a abrir NexoAudio."
+                )
+        else:
+            print(
+                "[!] ERROR: No se pudo abrir ningún dispositivo de captura WASAPI Loopback.\n"
+                "    Verifica en Windows que tengas un dispositivo de salida de audio activo (altavoces/audífonos)."
+            )
+
+        if self._open_mic_stream():
+            api = self.p.get_host_api_info_by_index(self.cable_dev["hostApi"])["name"]
+            fmt_name = "Float32" if self.mic_fmt == pyaudio.paFloat32 else "Int16"
+            print(
+                f"[OK] Micrófono Virtual conectado: {self.cable_dev['name']} "
+                f"[{api}] ({self.mic_rate}Hz, {self.mic_channels}ch, {fmt_name})"
+            )
+        else:
+            print(
+                "[!] AVISO: No se detectó o no se pudo abrir 'CABLE Input' (VB-Cable).\n"
+                "    Si quieres usar el micrófono del celular, instala VB-Cable y REINICIA la PC."
+            )
+
+        if not self._worker_started:
+            self._worker_started = True
+            threading.Thread(target=self._mic_writer_worker, daemon=True).start()
+
+    def set_streams_active(self, active: bool):
+        if self.loopback_stream:
+            try:
+                if active and self.loopback_stream.is_stopped():
+                    self.loopback_stream.start_stream()
+                elif not active and self.loopback_stream.is_active():
+                    self.loopback_stream.stop_stream()
+            except Exception as e:
+                print(f"[!] Error cambiando estado de Loopback: {e}")
+
+        with self._mic_lock:
+            if self.mic_stream:
+                try:
+                    if active and self.mic_stream.is_stopped():
+                        self.mic_stream.start_stream()
+                    elif not active and self.mic_stream.is_active():
+                        self.mic_stream.stop_stream()
+                except Exception:
+                    pass
 
     def process_mic_chunk(self, raw_bytes: bytes, in_rate: int) -> bytes:
-        """Convierte de la frecuencia del celular (ej. 48000Hz) a la de VB-Cable (ej. 44100Hz)."""
+        """Adapta el audio mono Int16 del celular a la frecuencia, canales y formato exactos de VB-Cable."""
         out_rate = self.mic_rate
-        out_channels = self.mic_channels
-
-        if in_rate == out_rate and out_channels == 1:
-            return raw_bytes
+        out_ch = self.mic_channels
 
         samples = array("h")
         samples.frombytes(raw_bytes)
@@ -236,85 +500,67 @@ class AudioEngine:
         if n_in == 0:
             return b""
 
-        if in_rate == out_rate and out_channels == 2:
-            stereo = array("h", [0]) * (n_in * 2)
-            stereo[0::2] = samples
-            stereo[1::2] = samples
-            return stereo.tobytes()
+        if not self._seen_mic_signal:
+            peak = max(abs(min(samples)), abs(max(samples)))
+            if peak > 120:
+                self._seen_mic_signal = True
+                print("[OK] Señal de voz recibida desde el celular -> enviando a VB-Cable.")
 
-        # Resampling lineal continuo con preservación de muestra previa sin listas intermedias
-        step = in_rate / out_rate
-        pos = self.resample_pos
-        prev = self.prev_sample
-        out_arr = array("h")
-        append = out_arr.append
-
-        while pos < n_in:
-            idx = int(pos)
-            frac = pos - idx
-            s0 = prev if idx == 0 else samples[idx - 1]
-            s1 = samples[idx]
-            val = max(-32768, min(32767, int(s0 + frac * (s1 - s0))))
-            append(val)
-            if out_channels == 2:
-                append(val)
-            pos += step
-
-        self.resample_pos = pos - n_in
-        self.prev_sample = samples[-1]
-        return out_arr.tobytes()
-
-    def _open_mic_stream(self):
-        """Prueba cada dispositivo de VB-Cable (WASAPI primero), priorizando 48000Hz para evitar remuestreo."""
-        for dev in find_vbcable_devices(self.p):
-            default_rate = int(dev["defaultSampleRate"])
-            candidate_rates = list(dict.fromkeys([48000, default_rate, 44100]))
-            for rate in candidate_rates:
-                for ch in (1, 2):
-                    try:
-                        stream = self.p.open(
-                            format=pyaudio.paInt16,
-                            channels=ch,
-                            rate=rate,
-                            output=True,
-                            frames_per_buffer=MIC_FRAMES,
-                            output_device_index=dev["index"],
-                        )
-                    except Exception:
-                        continue
-                    self.cable_dev, self.mic_rate, self.mic_channels, self.mic_stream = dev, rate, ch, stream
-                    return True
-        return False
-
-    def start(self):
-        def loopback_callback(in_data, frame_count, time_info, status):
-            if pc_queue is not None and main_loop is not None:
-                try:
-                    main_loop.call_soon_threadsafe(broadcast_pc_audio, in_data)
-                except RuntimeError:  # el loop ya se cerró
-                    pass
-            return (None, pyaudio.paContinue)
-
-        self.loopback_stream = self.p.open(
-            format=pyaudio.paInt16,
-            channels=self.pc_channels,
-            rate=self.pc_rate,
-            input=True,
-            start=False,  # inicia en pausa hasta que se conecte un cliente
-            frames_per_buffer=CHUNK_FRAMES,
-            input_device_index=self.loopback_dev["index"],
-            stream_callback=loopback_callback,
-        )
-        print(f"[OK] Captura de PC lista (Loopback): {self.loopback_dev['name']} ({self.pc_rate}Hz, {self.pc_channels}ch)")
-
-        if self._open_mic_stream():
-            api = self.p.get_host_api_info_by_index(self.cable_dev["hostApi"])["name"]
-            print(f"[OK] Micrófono Virtual conectado: {self.cable_dev['name']} [{api}] ({self.mic_rate}Hz, {self.mic_channels}ch)")
-            if "WASAPI" not in api:
-                print("[!] VB-Cable se abrió por una API distinta de WASAPI: la latencia del micrófono será mayor.")
-            threading.Thread(target=self._mic_writer_worker, daemon=True).start()
+        if in_rate == out_rate:
+            mono = samples
         else:
-            print("[!] AVISO: No se encontró o no se pudo abrir 'CABLE Input' (VB-Cable).")
+            step = in_rate / out_rate
+            pos = self.resample_pos
+            prev = self.prev_sample
+            mono = array("h")
+            append = mono.append
+            while pos < n_in:
+                idx = int(pos)
+                frac = pos - idx
+                s0 = prev if idx == 0 else samples[idx - 1]
+                s1 = samples[idx]
+                append(max(-32768, min(32767, int(s0 + frac * (s1 - s0)))))
+                pos += step
+            self.resample_pos = pos - n_in
+            self.prev_sample = samples[-1]
+
+        n_out = len(mono)
+        if n_out == 0:
+            return b""
+
+        if out_ch == 1:
+            final_samples = mono
+        elif out_ch == 2:
+            final_samples = array("h", [0]) * (n_out * 2)
+            final_samples[0::2] = mono
+            final_samples[1::2] = mono
+        else:
+            final_samples = array("h", [0]) * (n_out * out_ch)
+            final_samples[0::out_ch] = mono
+            final_samples[1::out_ch] = mono
+
+        if self.mic_fmt == pyaudio.paFloat32:
+            return int16_to_float32_bytes(final_samples)
+        return final_samples.tobytes()
+
+    def _try_reopen_mic_stream_locked(self):
+        now = time.monotonic()
+        if now - self._last_mic_reopen < 2.0 or self.p is None:
+            return
+        self._last_mic_reopen = now
+        if self.mic_stream:
+            try:
+                self.mic_stream.stop_stream()
+                self.mic_stream.close()
+            except Exception:
+                pass
+            self.mic_stream = None
+        if self._open_mic_stream():
+            try:
+                self.mic_stream.start_stream()
+                print(f"[*] Micrófono virtual recuperado: {self.cable_dev['name']} ({self.mic_rate}Hz, {self.mic_channels}ch)")
+            except Exception:
+                pass
 
     def _mic_writer_worker(self):
         last_err = None
@@ -322,14 +568,30 @@ class AudioEngine:
             data = mic_queue.get()
             if data is None:
                 break
-            try:
-                out = self.process_mic_chunk(data, self.client_rate)
-                if out:
-                    self.mic_stream.write(out)
-            except Exception as e:
-                if repr(e) != last_err:  # un log por tipo de error, sin inundar la consola
-                    last_err = repr(e)
-                    print(f"[!] Error escribiendo al micrófono virtual: {e!r}")
+            with self._mic_lock:
+                if self.mic_stream is None:
+                    continue
+                try:
+                    if self.mic_stream.is_stopped():
+                        self.mic_stream.start_stream()
+                    out = self.process_mic_chunk(data, self.client_rate)
+                    if out:
+                        self.mic_stream.write(out)
+                except Exception as e:
+                    if repr(e) != last_err:
+                        last_err = repr(e)
+                        print(f"[!] Error escribiendo a VB-Cable: {e!r} (reintentando abrir stream...)")
+                    self._try_reopen_mic_stream_locked()
+
+    def convert_pc_packet(self, raw_bytes: bytes) -> bytes:
+        out = normalize_pc_audio(raw_bytes, self.pc_fmt, self.pc_raw_channels, self.pc_decim)
+        if not self._seen_pc_signal and len(out) >= 4:
+            probe = array("h")
+            probe.frombytes(out[: min(len(out), 256)])
+            if probe and max(abs(min(probe)), abs(max(probe))) > 40:
+                self._seen_pc_signal = True
+                print("[OK] Señal de audio de la PC detectada -> transmitiendo al celular.")
+        return out
 
     def stop(self):
         try:
@@ -343,13 +605,19 @@ class AudioEngine:
                 self.loopback_stream.close()
             except Exception:
                 pass
-        if self.mic_stream:
+        with self._mic_lock:
+            if self.mic_stream:
+                try:
+                    self.mic_stream.stop_stream()
+                    self.mic_stream.close()
+                except Exception:
+                    pass
+                self.mic_stream = None
+        if self.p:
             try:
-                self.mic_stream.stop_stream()
-                self.mic_stream.close()
+                self.p.terminate()
             except Exception:
                 pass
-        self.p.terminate()
 
 
 audio_engine = AudioEngine()
@@ -369,24 +637,19 @@ PING_HEADERS = {
 
 
 async def ping_handler(request):
-    """Endpoint ligero con CORS y soporte de red privada para autodescubrimiento desde la app Android."""
     if request.method == "OPTIONS":
         return web.Response(status=204, headers=PING_HEADERS)
     sockname = request.transport.get_extra_info("sockname") if request.transport else None
     actual_ip = sockname[0] if sockname and isinstance(sockname, tuple) and sockname[0] != "0.0.0.0" else get_local_ip()
-    return web.json_response(
-        {"app": "nexoaudio", "ip": actual_ip},
-        headers=PING_HEADERS,
-    )
+    return web.json_response({"app": "nexoaudio", "ip": actual_ip}, headers=PING_HEADERS)
 
 
 async def websocket_handler(request):
     global active_ws, pc_queue
 
-    ws = web.WebSocketResponse(heartbeat=HEARTBEAT_SEC, max_msg_size=1 << 16)
+    ws = web.WebSocketResponse(heartbeat=HEARTBEAT_SEC, max_msg_size=1 << 17)
     await ws.prepare(request)
 
-    # Desactiva el algoritmo de Nagle (TCP_NODELAY) para enviar cada paquete de audio al instante sin tirones
     if request.transport is not None:
         raw_sock = request.transport.get_extra_info("socket")
         if raw_sock is not None:
@@ -395,9 +658,8 @@ async def websocket_handler(request):
             except Exception:
                 pass
 
-    q = asyncio.Queue(maxsize=32)
+    q = asyncio.Queue(maxsize=40)
 
-    # Sesión única: la conexión nueva reemplaza a la anterior
     old, active_ws, pc_queue = active_ws, ws, q
     if old is not None and not old.closed:
         print("[*] Nueva conexión: reemplazando la sesión anterior")
@@ -408,8 +670,8 @@ async def websocket_handler(request):
 
     drain(mic_queue, queue.Empty)
     audio_engine.client_rate = 48000
-    audio_engine.reset_resampler()
-    audio_engine.set_loopback_active(True)
+    audio_engine.reset_session_state()
+    audio_engine.set_streams_active(True)
     print(f"[+] Celular conectado desde {request.remote}")
 
     await ws.send_str(
@@ -420,16 +682,21 @@ async def websocket_handler(request):
                 "pc_channels": audio_engine.pc_channels,
                 "mic_rate": audio_engine.mic_rate,
                 "mic_channels": audio_engine.mic_channels,
+                "loopback_active": audio_engine.loopback_stream is not None,
+                "loopback_is_vbcable": audio_engine.loopback_is_vbcable,
                 "vbcable_active": audio_engine.mic_stream is not None,
             }
         )
     )
-    drain(q, asyncio.QueueEmpty)  # descarta lo acumulado mientras se reemplazaba la sesión previa
+    drain(q, asyncio.QueueEmpty)
 
     async def send_pc_audio_loop():
         try:
             while not ws.closed:
-                await ws.send_bytes(await q.get())
+                raw = await q.get()
+                payload = audio_engine.convert_pc_packet(raw)
+                if payload:
+                    await ws.send_bytes(payload)
         except Exception:
             pass
 
@@ -442,15 +709,16 @@ async def websocket_handler(request):
                     info = json.loads(msg.data)
                     if info.get("type") == "client_config":
                         rate = int(info.get("mic_rate", 48000))
-                        if 8000 <= rate <= 192000:  # evita step = 0 (bucle infinito) y valores absurdos
+                        if 8000 <= rate <= 192000:
                             audio_engine.client_rate = rate
-                            audio_engine.reset_resampler()
+                            audio_engine.resample_pos = 0.0
+                            audio_engine.prev_sample = 0
                             print(f"[*] Micrófono del celular a {rate}Hz -> Salida VB-Cable a {audio_engine.mic_rate}Hz")
                 except Exception:
                     pass
 
             elif msg.type == WSMsgType.BINARY and audio_engine.mic_stream is not None:
-                raw = msg.data[: len(msg.data) & ~1]  # int16 = 2 bytes por muestra
+                raw = msg.data[: len(msg.data) & ~1]
                 if not raw:
                     continue
                 if mic_queue.full():
@@ -466,7 +734,7 @@ async def websocket_handler(request):
         sender_task.cancel()
         if active_ws is ws:
             active_ws, pc_queue = None, None
-            audio_engine.set_loopback_active(False)
+            audio_engine.set_streams_active(False)
         print(f"[-] Celular desconectado ({request.remote})")
 
     return ws
@@ -476,7 +744,6 @@ async def main():
     global main_loop
     main_loop = asyncio.get_running_loop()
 
-    # Asegurar salida UTF-8 en consola de Windows para dibujar los bloques del QR
     try:
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
@@ -497,11 +764,9 @@ async def main():
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=PORT, ssl_context=ssl_ctx)
-    await site.start()
-    await web.TCPSite(runner, host="0.0.0.0", port=HTTP_PORT).start()  # sin TLS, para la app Android
+    await web.TCPSite(runner, host="0.0.0.0", port=PORT, ssl_context=ssl_ctx).start()
+    await web.TCPSite(runner, host="0.0.0.0", port=HTTP_PORT).start()
 
-    # Servidor UDP en puerto 8080 para autodescubrimiento instantáneo por Broadcast desde Android
     udp_transport = None
     try:
         udp_transport, _ = await main_loop.create_datagram_endpoint(
@@ -522,7 +787,6 @@ async def main():
     print(" >> Escanea este código QR con la cámara de tu celular:")
     print("=" * 62 + "\n")
 
-    # Generar e imprimir el código QR directamente en la terminal
     qr = qrcode.QRCode(
         version=1,
         error_correction=qrcode.constants.ERROR_CORRECT_L,

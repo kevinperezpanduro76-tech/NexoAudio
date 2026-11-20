@@ -77,7 +77,6 @@
     .toggle-btn.off { opacity: 0.5; border-color: var(--danger); color: #fca5a5; }
     .toggle-btn.on { border-color: var(--active); color: #6ee7b7; }
     .toggle-btn:disabled { opacity: 0.5; cursor: default; }
-    #toggleEcho { grid-column: 1 / -1; }
     [hidden] { display: none !important; }
     input { user-select: text; -webkit-user-select: text; }
     .ip-field { width: 100%; max-width: 380px; margin: 14px auto 0; }
@@ -131,6 +130,7 @@
     <button id="toggleSpeaker" class="toggle-btn">🔊 Altavoz: ON</button>
     <button id="toggleMic" class="toggle-btn">🎙️ Micrófono: ON</button>
     <button id="toggleEcho" class="toggle-btn">🎧 Anti-eco: OFF</button>
+    <button id="toggleStable" class="toggle-btn">📶 Buffer: Auto</button>
   </div>
 
   <div class="support">
@@ -141,10 +141,10 @@
     </div>
   </div>
 
-  <!-- AudioWorklet (se carga vía Blob URL): captura del micro + reproducción con ring buffer anti-chasquidos -->
+  <!-- AudioWorklet con jitter buffer adaptativo anti-cortes -->
   <script type="text/js-worklet" id="relay-worklet">
     const CAP = 1 << 17, MASK = CAP - 1;   // ring buffer: 131072 frames por canal (~2.7 s a 48 kHz)
-    const MIC_CHUNK = 512;                 // ~10 ms por paquete de micrófono
+    const MIC_CHUNK = 960;                 // ~20 ms por paquete de micrófono (mitad de sobrecarga Wi-Fi/IPC)
 
     class RelayProcessor extends AudioWorkletProcessor {
       constructor() {
@@ -152,25 +152,49 @@
         this.L = new Float32Array(CAP);
         this.R = new Float32Array(CAP);
         this.ch = 2;
+        this.inRate = 48000;
         this.ratio = 1;
-        this.target = 3600;                // ~75 ms a 48 kHz por defecto
+        this.baseMs = 90;
+        this.maxMs = 260;
+        this.curMs = 90;
+        this.target = 4320;
+        this.micOn = true;
         this.pcm = new Int16Array(MIC_CHUNK);
         this.ci = 0;
+        this.stableSamples = 0;
+        this.reportCounter = 0;
+        this.underruns = 0;
         this.reset();
         this.port.onmessage = (e) => {
           const m = e.data;
           if (m.type === "cfg") {
             this.ch = Math.max(1, m.channels | 0);
-            // Relación exacta entre los Hz de la PC y los Hz nativos de este celular
-            this.ratio = m.rate / sampleRate;
-            this.target = Math.round(m.rate * (m.targetMs || 75) / 1000);
+            this.inRate = m.rate || 48000;
+            this.ratio = this.inRate / sampleRate;
+            this.baseMs = m.targetMs || 90;
+            this.maxMs = m.maxMs || 260;
+            this.curMs = this.baseMs;
+            this.updateTarget();
             this.reset();
+          } else if (m.type === "buffer_mode") {
+            this.baseMs = m.targetMs || 90;
+            this.maxMs = m.maxMs || 260;
+            if (this.curMs < this.baseMs) this.curMs = this.baseMs;
+            if (this.curMs > this.maxMs) this.curMs = this.maxMs;
+            this.updateTarget();
+          } else if (m.type === "mic") {
+            this.micOn = Boolean(m.enabled);
+            this.ci = 0;
           } else if (m.type === "flush") {
             this.reset();
           } else if (m.type === "pcm") {
             this.write(new Int16Array(m.buf));
           }
         };
+      }
+
+      updateTarget() {
+        this.target = Math.max(512, Math.round(this.inRate * this.curMs / 1000));
       }
 
       reset() {
@@ -184,6 +208,7 @@
         this.fadeL = 0;
         this.fadeR = 0;
         this.playing = false;
+        this.stableSamples = 0;
       }
 
       write(s) {
@@ -192,18 +217,19 @@
         for (let i = 0; i < n; i++) {
           const o = i * ch, j = (this.w + i) & MASK;
           let l = s[o], r = ch > 1 ? s[o + 1] : l;
-          if (ch >= 6) {   // 5.1 -> estéreo (suma centro y traseros sin saturar)
+          if (ch >= 6) {
             const c = s[o + 2] * 0.7071;
-            l = (l + c + s[o + 4] * 0.7071) * 0.6;
-            r = (r + c + s[o + 5] * 0.7071) * 0.6;
+            l = (l + c + s[o + 4] * 0.7071) * 0.58;
+            r = (r + c + s[o + 5] * 0.7071) * 0.58;
           }
           this.L[j] = l / 32768;
           this.R[j] = r / 32768;
         }
         this.w += n;
 
-        // Si se acumula demasiado retraso (> 5x el colchón), salta al colchón aplicando crossfade suave (sin clap)
-        if (this.w - this.rp > this.target * 5) {
+        // Si el retraso acumulado excede el límite seguro, salta al colchón con crossfade suave
+        const maxLag = Math.min(CAP - 4096, Math.max(this.target * 3, Math.round(this.inRate * 0.45)));
+        if (this.w - this.rp > maxLag) {
           this.fadeL = this.lastL;
           this.fadeR = this.lastR;
           this.rp = this.w - this.target;
@@ -213,21 +239,21 @@
       }
 
       process(inputs, outputs) {
-        // --- Captura: mono -> Int16 en bloques de 512, transferidos sin copia ---
-        const inp = inputs[0] && inputs[0][0];
+        // --- Captura del micrófono solo cuando está habilitado ---
+        const inp = this.micOn && inputs[0] && inputs[0][0];
         if (inp) {
           for (let i = 0; i < inp.length; i++) {
             const s = Math.max(-1, Math.min(1, inp[i]));
             this.pcm[this.ci++] = s < 0 ? s * 32768 : s * 32767;
             if (this.ci === MIC_CHUNK) {
-              this.port.postMessage(this.pcm.buffer, [this.pcm.buffer]);
+              this.port.postMessage({ type: "mic", buf: this.pcm.buffer }, [this.pcm.buffer]);
               this.pcm = new Int16Array(MIC_CHUNK);
               this.ci = 0;
             }
           }
         }
 
-        // --- Reproducción: ring buffer con crossfade anti-pop y adaptación suave de Hz ---
+        // --- Reproducción con jitter buffer adaptativo y crossfade anti-pop ---
         const out = outputs[0], oL = out[0], oR = out[1] || out[0];
         const fill = this.w - this.rp;
 
@@ -239,13 +265,23 @@
           this.fs = fill;
         }
 
-        // Promedio lento del nivel de buffer para ignorar el jitter normal del Wi-Fi
-        this.fs += (fill - this.fs) * 0.003;
+        if (this.playing) {
+          this.fs += (fill - this.fs) * 0.0025;
+          this.stableSamples += oL.length;
+          // Tras 12 segundos sin cortes, reduce gradualmente el colchón hacia baseMs
+          if (this.stableSamples >= sampleRate * 12) {
+            this.stableSamples = 0;
+            if (this.curMs > this.baseMs) {
+              this.curMs = Math.max(this.baseMs, this.curMs - 10);
+              this.updateTarget();
+            }
+          }
+        }
+
         const diff = this.fs - this.target;
-        // Zona muerta del 20%: solo ajusta la velocidad si realmente hay deriva de reloj entre PC y celular
-        const adj = Math.abs(diff) < this.target * 0.2
+        const adj = Math.abs(diff) < this.target * 0.25
           ? 0
-          : Math.max(-0.005, Math.min(0.005, diff / (this.target * 60)));
+          : Math.max(-0.005, Math.min(0.005, diff / (this.target * 65)));
         const step = this.ratio * (1 + adj);
 
         for (let i = 0; i < oL.length; i++) {
@@ -256,9 +292,8 @@
             l = this.L[a] + f * (this.L[b] - this.L[a]);
             r = this.R[a] + f * (this.R[b] - this.R[a]);
 
-            // Crossfade continuo desde la muestra anterior (elimina los claps al reconectar o saltar buffer)
             if (this.g < 1) {
-              this.g = Math.min(1, this.g + 0.004); // ~5 ms de fundido cruzado suave
+              this.g = Math.min(1, this.g + 0.004);
               l = this.fadeL + (l - this.fadeL) * this.g;
               r = this.fadeR + (r - this.fadeR) * this.g;
             }
@@ -267,8 +302,16 @@
             this.lastR = r;
             this.dk = 1;
           } else {
-            // Si falta red, decae suavemente sin chasquido (~12 ms) y espera a recargar el colchón
-            this.playing = false;
+            if (this.playing) {
+              // Ocurrió un corte por jitter de red: amplía automáticamente el buffer para estabilizar este celular
+              this.playing = false;
+              this.underruns++;
+              this.stableSamples = 0;
+              if (this.curMs < this.maxMs) {
+                this.curMs = Math.min(this.maxMs, this.curMs + 30);
+                this.updateTarget();
+              }
+            }
             l = this.lastL * this.dk;
             r = this.lastR * this.dk;
             this.lastL = l;
@@ -279,10 +322,15 @@
           oR[i] = r;
         }
 
-        // Normaliza los punteros para mantener la precisión decimal en sesiones largas
         if (this.rp >= CAP) {
           this.rp -= CAP;
           this.w -= CAP;
+        }
+
+        this.reportCounter += oL.length;
+        if (this.reportCounter >= sampleRate * 2) {
+          this.reportCounter = 0;
+          this.port.postMessage({ type: "stats", curMs: this.curMs, underruns: this.underruns });
         }
         return true;
       }
@@ -291,12 +339,15 @@
   </script>
 
   <script>
-    const TARGET_MS = 75;           // colchón anti-jitter: 75 ms absorbe micro-cortes de Wi-Fi sin claps
+    const AUTO_BASE_MS = 90;        // inicio bajo, sube automáticamente hasta 260 ms si hay jitter Wi-Fi
+    const AUTO_MAX_MS = 260;
+    const STABLE_BASE_MS = 160;     // modo estable para celulares con Wi-Fi irregular
+    const STABLE_MAX_MS = 320;
     const CONNECT_TIMEOUT_MS = 8000;
-    const AUTO_RETRY_MS = 3500;     // reintento automático en segundo plano mientras esté en espera
-    const KOFI_URL = "";            // <- si agregas un enlace de Ko-fi, aparecerá junto a Patreon
+    const AUTO_RETRY_MS = 3500;
+    const KOFI_URL = "";
     const PATREON_URL = "https://patreon.com/Kaell456?utm_medium=unknown&utm_source=join_link&utm_campaign=creatorshare_creator&utm_content=copyLink";
-    const APP_PORT = 8080;          // puerto sin TLS del servidor (lo usa la app Android)
+    const APP_PORT = 8080;
     const IN_APP = Boolean(
       window.Capacitor ||
       window.NexoNative ||
@@ -306,14 +357,18 @@
     );
 
     let ws = null, audioCtx = null, micStream = null, micSource = null, node = null, wakeLock = null;
-    let state = "idle";             // idle | connecting | connected
+    let state = "idle";
     let speakerEnabled = true;
     let micEnabled = true;
-    let echoCancel = false;         // anti-eco del navegador: apagado por defecto (audio crudo)
+    let echoCancel = false;
+    let stableMode = false;
     let switchingMic = false;
     let scanning = false;
-    let manualDisconnect = false;   // evita reconectar a la fuerza si el usuario desconectó manualmente
+    let manualDisconnect = false;
     let lastPcRate = 48000;
+    let currentBufferMs = AUTO_BASE_MS;
+    let serverInfo = { vbcable_active: true, loopback_active: true, loopback_is_vbcable: false };
+    let micIssue = "";
 
     const connectBtn = document.getElementById("connectBtn");
     const btnLabel = document.getElementById("btnLabel");
@@ -322,6 +377,7 @@
     const toggleSpeakerBtn = document.getElementById("toggleSpeaker");
     const toggleMicBtn = document.getElementById("toggleMic");
     const toggleEchoBtn = document.getElementById("toggleEcho");
+    const toggleStableBtn = document.getElementById("toggleStable");
     const ipField = document.getElementById("ipField");
     const ipInput = document.getElementById("serverIp");
     const scanBtn = document.getElementById("scanBtn");
@@ -330,7 +386,10 @@
     const patreonLink = document.getElementById("patreonLink");
 
     ipField.hidden = !IN_APP;
-    try { ipInput.value = localStorage.getItem("serverIp") || ""; } catch (e) {}
+    try {
+      ipInput.value = localStorage.getItem("serverIp") || "";
+      stableMode = localStorage.getItem("stableMode") === "1";
+    } catch (e) {}
 
     patreonLink.href = PATREON_URL;
     if (KOFI_URL && !KOFI_URL.includes("TU_USUARIO")) {
@@ -346,12 +405,33 @@
       links.hidden = !links.hidden;
     });
 
-    // Desbloquea el AudioContext al primer toque en pantalla si el sistema lo mantuvo suspendido
+    function bufferParams() {
+      return stableMode
+        ? { targetMs: STABLE_BASE_MS, maxMs: STABLE_MAX_MS }
+        : { targetMs: AUTO_BASE_MS, maxMs: AUTO_MAX_MS };
+    }
+
+    function renderStableBtn() {
+      toggleStableBtn.textContent = stableMode ? "🛡️ Buffer: Estable" : "📶 Buffer: Auto";
+      toggleStableBtn.classList.toggle("on", stableMode);
+    }
+    renderStableBtn();
+
+    toggleStableBtn.addEventListener("click", () => {
+      stableMode = !stableMode;
+      try { localStorage.setItem("stableMode", stableMode ? "1" : "0"); } catch (e) {}
+      renderStableBtn();
+      const bp = bufferParams();
+      currentBufferMs = bp.targetMs;
+      if (node) node.port.postMessage({ type: "buffer_mode", ...bp });
+      if (state === "connected") statusText.textContent = connectedText();
+    });
+
     const unlockAudioOnTouch = () => {
       if (audioCtx && audioCtx.state === "suspended") {
         audioCtx.resume().catch(() => {});
       }
-      if (state === "connected" && micEnabled && !micStream) {
+      if (state === "connected" && micEnabled && !micStream && !micIssue) {
         attachMicrophone();
       }
     };
@@ -392,7 +472,6 @@
       throw new Error("no_match");
     }
 
-    // Obtiene los prefijos de subred reales del teléfono desde el puente nativo Android y/o WebRTC
     async function getPhoneSubnetPrefixes() {
       const prefixes = new Set();
       if (window.NexoNative && typeof window.NexoNative.getLocalSubnets === "function") {
@@ -427,7 +506,6 @@
       return [...prefixes];
     }
 
-    // Escanea una lista de IPs con concurrencia controlada para no saturar sockets del WebView
     async function scanIpList(ips, concurrency = 16, timeoutMs = 700) {
       if (!ips.length) return null;
       return new Promise((resolve) => {
@@ -468,28 +546,23 @@
       try {
         const saved = ipInput.value.trim().replace(/^[a-z]+:\/\//i, "").replace(/[:/].*$/, "");
 
-        // 1. Descubrimiento instantáneo por Broadcast UDP nativo (encuentra la PC en ~10 ms en cualquier subred)
         if (window.NexoNative && typeof window.NexoNative.discoverServer === "function") {
           try {
             const udpIp = (window.NexoNative.discoverServer(APP_PORT, 420) || "").trim();
-            if (/^\d+\.\d+\.\d+\.\d+$/.test(udpIp)) {
-              discoveredIp = udpIp;
-            }
+            if (/^\d+\.\d+\.\d+\.\d+$/.test(udpIp)) discoveredIp = udpIp;
           } catch (e) {}
         }
 
-        // 2. Verificación rápida de IP guardada y puertas de enlace de Hotspot (Windows y Android)
         if (!discoveredIp && state === "idle") {
           const quickCandidates = [...new Set([
             /^\d+\.\d+\.\d+\.\d+$/.test(saved) ? saved : null,
-            "192.168.137.1", // Zona con cobertura inalámbrica de Windows
-            "192.168.43.1"   // Hotspot de Android
+            "192.168.137.1",
+            "192.168.43.1"
           ].filter(Boolean))];
           const quickHit = await scanIpList(quickCandidates, 4, 650);
           if (quickHit) discoveredIp = quickHit;
         }
 
-        // 3. Escaneo por subredes priorizando las interfaces reales detectadas en el celular
         if (!discoveredIp && state === "idle") {
           const phonePrefixes = await getPhoneSubnetPrefixes();
           const savedPrefix = saved.match(/^(\d+\.\d+\.\d+)\./)?.[1];
@@ -553,16 +626,37 @@
       micEnabled = !micEnabled;
       toggleMicBtn.textContent = micEnabled ? "🎙️ Micrófono: ON" : "🚫 Micrófono: OFF";
       toggleMicBtn.classList.toggle("off", !micEnabled);
+      if (node) node.port.postMessage({ type: "mic", enabled: micEnabled });
       if (micEnabled && state === "connected" && !micStream) {
+        micIssue = "";
         attachMicrophone();
       }
+      if (state === "connected") statusText.textContent = connectedText();
     });
 
-    const micConstraints = () => ({ echoCancellation: echoCancel, noiseSuppression: false, autoGainControl: false, channelCount: 1 });
+    const micConstraints = () => ({
+      echoCancellation: echoCancel,
+      noiseSuppression: echoCancel,
+      autoGainControl: true,
+      channelCount: { ideal: 1 }
+    });
+
     const connectedText = () => {
+      if (!serverInfo.loopback_active) {
+        return "⚠️ PC sin salida de audio activa (revisa altavoces en Windows)";
+      }
+      if (serverInfo.loopback_is_vbcable) {
+        return "⚠️ En Windows cambia el altavoz predeterminado fuera de VB-Cable";
+      }
+      if (!serverInfo.vbcable_active) {
+        return `Altavoz activo (${currentBufferMs} ms) | VB-Cable no detectado en PC`;
+      }
+      if (micEnabled && micIssue) {
+        return `Altavoz activo (${currentBufferMs} ms) | ${micIssue}`;
+      }
       const phoneHz = audioCtx ? audioCtx.sampleRate : 48000;
       const hzInfo = lastPcRate && lastPcRate !== phoneHz ? `${lastPcRate}→${phoneHz} Hz` : `${phoneHz} Hz`;
-      return `Audio ${echoCancel ? "con anti-eco" : "en crudo"} activo (${hzInfo})`;
+      return `Activo (${hzInfo} · buffer ${currentBufferMs} ms)`;
     };
 
     function renderEcho() {
@@ -570,20 +664,44 @@
       toggleEchoBtn.classList.toggle("on", echoCancel);
     }
 
-    async function attachMicrophone() {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !audioCtx || !node || micStream) return;
+    async function requestMicStream() {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints() });
+        return await navigator.mediaDevices.getUserMedia({ audio: micConstraints() });
+      } catch (err) {
+        // Respaldo si el dispositivo rechaza alguna constraint (ej. channelCount o autoGainControl)
+        if (err && (err.name === "OverconstrainedError" || err.name === "TypeError")) {
+          return await navigator.mediaDevices.getUserMedia({ audio: true });
+        }
+        throw err;
+      }
+    }
+
+    async function attachMicrophone() {
+      if (!micEnabled || !audioCtx || !node || micStream) return;
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        micIssue = "Micrófono bloqueado (usa la APK o abre por HTTPS)";
+        if (state === "connected") statusText.textContent = connectedText();
+        return;
+      }
+      try {
+        const stream = await requestMicStream();
         if (state === "idle" || !audioCtx || !node) {
           stream.getTracks().forEach((t) => t.stop());
           return;
         }
+        micIssue = "";
         micStream = stream;
         micSource = audioCtx.createMediaStreamSource(micStream);
         micSource.connect(node);
+        node.port.postMessage({ type: "mic", enabled: micEnabled });
         if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
+        if (state === "connected") statusText.textContent = connectedText();
       } catch (err) {
-        console.warn("Permiso o acceso al micrófono pendiente:", err);
+        console.warn("Error accediendo al micrófono:", err);
+        micIssue = err && err.name === "NotAllowedError"
+          ? "Sin permiso de micrófono"
+          : "No se pudo abrir el micrófono";
+        if (state === "connected") statusText.textContent = connectedText();
       }
     }
 
@@ -595,7 +713,7 @@
 
       switchingMic = true;
       try {
-        const next = await navigator.mediaDevices.getUserMedia({ audio: micConstraints() });
+        const next = await requestMicStream();
         if (state !== "connected") { next.getTracks().forEach((t) => t.stop()); return; }
         if (micSource) micSource.disconnect();
         micStream.getTracks().forEach((t) => t.stop());
@@ -643,6 +761,7 @@
 
     function stopConnection(msg) {
       state = "idle";
+      micIssue = "";
       if (ws) {
         const s = ws;
         ws = null;
@@ -688,15 +807,15 @@
         return;
       }
       state = "connecting";
+      micIssue = "";
       setUI("connecting", "Conectando con la laptop...");
 
       try {
-        // 1. Usa la frecuencia nativa del hardware de cada celular para evitar doble remuestreo del sistema Android
         const Ctx = window.AudioContext || window.webkitAudioContext;
-        audioCtx = new Ctx({ latencyHint: "interactive" });
+        // "balanced" evita cortes de hardware en celulares Android con buffers muy ajustados
+        audioCtx = new Ctx({ latencyHint: "balanced" });
         audioCtx.resume().catch(() => {});
 
-        // 2. AudioWorklet cargado desde un Blob
         const blobUrl = URL.createObjectURL(
           new Blob([document.getElementById("relay-worklet").textContent], { type: "application/javascript" })
         );
@@ -709,13 +828,13 @@
           channelCount: 1,
           channelCountMode: "explicit"
         });
-        node.port.onmessage = onMicChunk;
+        node.port.onmessage = onWorkletMessage;
+        node.port.postMessage({ type: "mic", enabled: micEnabled });
         node.connect(audioCtx.destination);
 
-        // 3. Abre el WebSocket de inmediato y solicita el micrófono en paralelo
         acquireWakeLock();
         openSocket();
-        attachMicrophone();
+        if (micEnabled) attachMicrophone();
       } catch (err) {
         stopConnection("Error: " + (err.message || "No se pudo iniciar el motor de audio"));
       }
@@ -732,7 +851,6 @@
         state = "connected";
         if (audioCtx && audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
         setUI("connected", connectedText());
-        // Informa los Hz nativos exactos de este celular al servidor
         sock.send(JSON.stringify({ type: "client_config", mic_rate: audioCtx ? audioCtx.sampleRate : 48000 }));
       };
       sock.onmessage = onSocketMessage;
@@ -760,10 +878,15 @@
         try { msg = JSON.parse(event.data); } catch (e) { return; }
         if (msg.type === "config" && node) {
           lastPcRate = msg.pc_rate || 48000;
-          node.port.postMessage({ type: "cfg", rate: msg.pc_rate, channels: msg.pc_channels, targetMs: TARGET_MS });
-          statusText.textContent = msg.vbcable_active
-            ? connectedText()
-            : "Conectado (Altavoz activo | VB-Cable no detectado en PC)";
+          serverInfo = {
+            vbcable_active: Boolean(msg.vbcable_active),
+            loopback_active: msg.loopback_active !== false,
+            loopback_is_vbcable: Boolean(msg.loopback_is_vbcable)
+          };
+          const bp = bufferParams();
+          currentBufferMs = bp.targetMs;
+          node.port.postMessage({ type: "cfg", rate: msg.pc_rate, channels: msg.pc_channels, ...bp });
+          statusText.textContent = connectedText();
         }
         return;
       }
@@ -771,13 +894,23 @@
       node.port.postMessage({ type: "pcm", buf: event.data }, [event.data]);
     }
 
-    function onMicChunk(e) {
-      if (!micEnabled || !ws || ws.readyState !== WebSocket.OPEN) return;
-      if (ws.bufferedAmount > 16384) return;
-      ws.send(e.data);
+    function onWorkletMessage(e) {
+      const m = e.data;
+      if (!m) return;
+      if (m.type === "stats") {
+        if (m.curMs !== currentBufferMs) {
+          currentBufferMs = m.curMs;
+          if (state === "connected") statusText.textContent = connectedText();
+        }
+        return;
+      }
+      if (m.type === "mic") {
+        if (!micEnabled || !ws || ws.readyState !== WebSocket.OPEN) return;
+        if (ws.bufferedAmount > 32768) return;
+        ws.send(m.buf);
+      }
     }
 
-    // Autodescubrimiento y autoconexión al iniciar y en segundo plano mientras esté en espera
     if (IN_APP) {
       const triggerAuto = () => {
         if (state === "idle" && !scanning && !manualDisconnect && document.activeElement !== ipInput) {
